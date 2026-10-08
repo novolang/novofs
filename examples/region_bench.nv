@@ -1,0 +1,438 @@
+// examples/region_bench.nv: novofs on a board's reserved
+// flash region, through RegionFlash and `hal.block`'s region surface,
+// in four boots.
+//
+//   novo build --target=nrf52832-dk --cov region_bench.nv
+//
+// The build needs the novofs modules flash, crc32, meta, nvfs and
+// regionflash from src/ beside this file, with devtools.nv from this
+// directory; each board's tests/novofs.sh assembles them, erases the
+// region through the probe, runs the program and resets the board
+// between the boots.
+//
+// The program finds its stage on the volume: a region that holds no
+// filesystem is stage 0, and each later stage is the number in the file
+// /stage.  Each line it prints is `name=value`, for the suite to read.
+//
+//   0. The region is erased.  A mount without format-on-empty is
+//      refused with ENoFs, and one with it formats and mounts.  Then
+//      an explicit format and a mount; /a (40 bytes) is written and read
+//      back, /b (100 bytes) is written, and /c (3000 bytes, a file
+//      outside its directory record) where the volume has a block for
+//      it; a remount in the same boot reads them again.  RegionFlash's
+//      refusals and the RAM in use are printed.  The program stops, and
+//      the suite resets the board.
+//   1. After the reset: /a, /b and /c read back.  /a is removed, then
+//      files are written until the volume refuses one, and removed.
+//      /pl is written as 7, and then as 8 through CutFlash, which
+//      programs half of the write's first prog and resets the core: a
+//      power cut in the middle of a write.
+//   2. After the cut: /pl reads 7, the record in flight lost, and the
+//      rest of the volume reads as before.  /pl is written as 9, which
+//      the volume takes after the torn record.  Then the program writes
+//      /pl and /p2 with the same rising number, over and over, until the
+//      suite resets the board at a moment it does not choose.
+//   3. After that reset: /p2 holds the number /pl holds, or the one
+//      before it, which is the write in flight when the reset came.
+//      The volume's digest is printed for the suite to compare with the
+//      host's reading of the region through the probe.
+
+use flash
+use meta
+use nvfs
+use regionflash
+use devtools
+
+let A_LEN = 40
+let B_LEN = 100
+let C_LEN = 3000
+// Fill files: one block each where the volume has data blocks, inline
+// records where it has only its metadata pair.
+let FILL_BLOCK_LEN  = 1000
+let FILL_INLINE_LEN = 400
+let FILL_MAX        = 600
+
+// The stack below the initial stack pointer that the program paints
+// before it runs, and the bytes at the top it leaves alone for the
+// frames of `main` and of the painting.
+let PAINT_BYTES = 4864
+let PAINT_TOP   = 768
+let PAINT_WORD  = 0x5A5A5A5A
+
+// The format every stage uses: the defaults, with inline files up to
+// 400 bytes, so a volume of two erase units fills with records.
+@tier(embedded)
+fn bench_config() -> FsConfig
+    FsConfig { block_cycles: 100, cache_size: 512, lookahead_size: 16, name_max: 32,
+               file_max: 2147483647, inline_max: 400 }
+
+fn line(name: Str, v: Int) [hw]
+    hal.uart.write(name)
+    hal.uart.write("=")
+    hal.uart.write(str.from_int(v))
+    hal.uart.write("\n")
+
+fn word(name: Str, s: Str) [hw]
+    hal.uart.write(name)
+    hal.uart.write("=")
+    hal.uart.write(s)
+    hal.uart.write("\n")
+
+// `line` without building a string: a literal per digit.  A volume's
+// method reaches every device's `prog` in the program, CutFlash's
+// included, so the cutting device's output allocates nothing and the
+// write path stays `@no_alloc`.
+fn quiet_line(name: Str, v: Int) [hw]
+    hal.uart.write(name)
+    hal.uart.write("=")
+    digits(v)
+    hal.uart.write("\n")
+
+fn digits(v: Int) [hw]
+    if v >= 10
+        digits(v / 10)
+    let d = v % 10
+    hal.uart.write((if d == 0 then "0" else (if d == 1 then "1" else (if d == 2 then "2"
+                   else (if d == 3 then "3" else (if d == 4 then "4" else (if d == 5 then "5"
+                   else (if d == 6 then "6" else (if d == 7 then "7" else (if d == 8 then "8"
+                   else "9"))))))))))
+
+// ── The stack, measured by painting ─────────────────────────────────
+
+// The initial stack pointer: the first word of the vector table, whose
+// address VTOR holds.
+fn stack_top() -> Int [hw]
+    hw.mem_read32(hw.mem_read32(0xE000ED08))
+
+fn paint() [hw, mutate]
+    let top = stack_top()
+    for w in 0..(PAINT_BYTES - PAINT_TOP) / 4
+        hw.mem_write32(top - PAINT_BYTES + 4 * w, PAINT_WORD)
+
+// The deepest the main stack has reached since `paint`, in bytes below
+// the initial stack pointer: the lowest painted word that changed.
+// PAINT_BYTES when the bottom word changed, so the depth is at least
+// that.
+fn stack_depth() -> Int [hw]
+    let top = stack_top()
+    for w in 0..(PAINT_BYTES - PAINT_TOP) / 4
+        if hw.mem_read32(top - PAINT_BYTES + 4 * w) != PAINT_WORD
+            return PAINT_BYTES - 4 * w
+    PAINT_TOP
+
+// ── A device that cuts the power in the middle of a write ───────────
+
+// The progs CutFlash has seen.
+var cut_seen = 0
+
+// RegionFlash, except that prog number `cut` programs the first half of
+// its bytes, rounded down to whole pages, and resets the core.
+@value
+struct CutFlash
+    dev: RegionFlash
+    cut: Int
+
+impl Flash[hw, mutate] for CutFlash
+    fn read_size(self) -> Int
+        self.dev.read_size()
+
+    fn prog_size(self) -> Int
+        self.dev.prog_size()
+
+    fn block_size(self) -> Int
+        self.dev.block_size()
+
+    fn block_count(self) -> Int
+        self.dev.block_count()
+
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [hw, mutate]
+        self.dev.read(block, off, len, dst)
+
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [hw, mutate]
+        cut_seen = cut_seen + 1
+        if cut_seen < self.cut
+            return self.dev.prog(block, off, src)
+        let page = self.dev.prog_size()
+        var half: Buf = Vec.new()
+        for i in 0..src.len() / 2 / page * page
+            let _ = half.push(src[i])
+        let _ = self.dev.prog(block, off, half)
+        quiet_line("cut at prog", cut_seen)
+        quiet_line("cut bytes", half.len())
+        hal.uart.write("resetting\n")
+        // The reset wipes the RTT buffer, so the lines of this stage
+        // wait for the host's reader, which polls the buffer every few
+        // tens of milliseconds, before the core goes.
+        hal.timer.delay_ms(500)
+        // SYSRESETREQ, through the Application Interrupt and Reset
+        // Control Register.
+        hw.mem_write32(0xE000ED0C, 0x05FA0004)
+        loop
+            pass
+
+    fn erase(self, block: Int) -> Bool [hw, mutate]
+        self.dev.erase(block)
+
+    fn sync(self) -> Bool [hw, mutate]
+        self.dev.sync()
+
+// ── Reading files back ──────────────────────────────────────────────
+
+// The buffer every read of the bench goes through.  It is module state,
+// not a local, so the bench's own frames stay small beside the
+// filesystem's, whose depth the stack figures measure.
+var rb: Buf = Vec.new()
+
+// How many of the `n` bytes of `path` match pattern `seed`; -1 when the
+// file cannot be read or is not `n` bytes long.
+@no_alloc
+fn matching<D: Flash[e]>(vol: Volume<D>, path: Str, n: Int, seed: Int) -> Int [mutate, e]
+    if vol.file_size(path) != n
+        return -1
+    var good = 0
+    var pos = 0
+    for chunk in 0..n / BUF_CAP + 1
+        if pos >= n
+            break
+        var len = n - pos
+        if len > BUF_CAP
+            len = BUF_CAP
+        if vol.file_read_at(path, pos, len, rb) != EOk
+            return -1
+        for i in 0..len
+            if (rb[i] as Int) == ((pos + i) * 7 + seed) % 251
+                good = good + 1
+        pos = pos + len
+    good
+
+// The four-byte number in `path`, or -1.
+@no_alloc
+fn number<D: Flash[e]>(vol: Volume<D>, path: Str) -> Int [mutate, e]
+    if vol.file_read_at(path, 0, 4, rb) != EOk
+        return -1
+    rb[0] as Int + rb[1] as Int * 256 + rb[2] as Int * 65536 + rb[3] as Int * 16777216
+
+// The live entries of the root directory.
+@no_alloc
+fn entries<D: Flash[e]>(vol: Volume<D>) -> Int [mutate, e]
+    let o = vol.dir_open("/")
+    if o.err != EOk
+        return -1
+    var cur = o.cur
+    var n = 0
+    for step in 0..FILL_MAX
+        let en = vol.dir_next(cur)
+        if not en.found
+            break
+        n = n + 1
+    n
+
+// ── The write path, in fixed memory ─────────────────────────────────
+
+// Formats the region and writes /a and /b on a volume mounted from it:
+// the stage-0 work, every call of it under `@no_alloc`.  The mount
+// itself is the one allocation a volume makes, and happens before.
+// Answers the volume's revision, or a negative step number.
+@no_alloc
+fn write_path(vol: Volume<RegionFlash>) -> Int [hw, mutate]
+    match vol.mounted()
+        MErr(e)   => -2
+        MOk(info) =>
+            if vol.file_write("/a", Pat { n: A_LEN, seed: 1 }) != EOk
+                return -3
+            if vol.file_write("/b", Pat { n: B_LEN, seed: 2 }) != EOk
+                return -4
+            info.rev
+
+// ── The stages ──────────────────────────────────────────────────────
+
+fn stage0(dev: RegionFlash) [hw, mutate]
+    hal.uart.write("stage 0\n")
+    match nvfs.mount_with(dev, bench_config(), false).mounted()
+        MOk(info) => word("empty without format", "mounted")
+        MErr(e)   => word("empty without format", nvfs.err_str(e))
+    match nvfs.mount_with(dev, bench_config(), true).mounted()
+        MOk(info) => line("formatted on empty rev", info.rev)
+        MErr(e)   => word("formatted on empty", nvfs.err_str(e))
+    line("heap after mount", core.rt.heap_alloced())
+    line("stack after mount", stack_depth())
+    if nvfs.format(dev, bench_config()) != EOk
+        line("write path", -1)
+    else
+        line("write path", write_path(nvfs.mount(dev)))
+    let heap_before = core.rt.heap_alloced()
+    let vol = nvfs.mount(dev)
+    line("heap per volume", core.rt.heap_alloced() - heap_before)
+    match vol.mounted()
+        MErr(e)   => word("mount", nvfs.err_str(e))
+        MOk(info) =>
+            word("mount", "ok")
+            line("read a", matching(vol, "/a", A_LEN, 1))
+            let rc = vol.file_write("/c", Pat { n: C_LEN, seed: 3 })
+            word("write c", nvfs.err_str(rc))
+            line("heap at deepest write", core.rt.heap_alloced())
+            line("heap high water", core.rt.heap_high_water())
+            line("stack at deepest write", stack_depth())
+    let again = nvfs.mount(vol.unmount())
+    match again.mounted()
+        MErr(e)   => word("remount", nvfs.err_str(e))
+        MOk(info) =>
+            line("remount rev", info.rev)
+            line("read a again", matching(again, "/a", A_LEN, 1))
+            line("read b", matching(again, "/b", B_LEN, 2))
+            line("read c", matching(again, "/c", C_LEN, 3))
+            refusals(dev)
+            line("stage write", (if again.file_write("/stage", Word { v: 1 }) == EOk then 1 else 0))
+    line("stack deepest", stack_depth())
+    hal.uart.write("stage 0 done\n")
+
+// What RegionFlash refuses, and the partitions it gives no blocks.
+fn refusals(dev: RegionFlash) [hw, mutate]
+    let n = dev.block_count()
+    let page = dev.prog_size()
+    line("page", dev.read_size())
+    line("read block -1", (if dev.read(-1, 0, page, rb) then 1 else 0))
+    line("read block count", (if dev.read(n, 0, page, rb) then 1 else 0))
+    line("read misaligned", (if dev.read(0, 1, page, rb) then 1 else 0))
+    line("read past block", (if dev.read(0, dev.block_size() - page, 2 * page, rb) then 1 else 0))
+    line("read too long", (if dev.read(0, 0, BUF_CAP + page, rb) then 1 else 0))
+    line("read negative", (if dev.read(0, -page, page, rb) then 1 else 0))
+    line("read length -1", (if dev.read(0, 0, -1, rb) then 1 else 0))
+    rb.clear()
+    for i in 0..page + 1
+        let _ = rb.push(0 as u8)
+    line("prog misaligned length", (if dev.prog(n - 1, 0, rb) then 1 else 0))
+    line("erase block -1", (if dev.erase(-1) then 1 else 0))
+    line("erase block count", (if dev.erase(n) then 1 else 0))
+    line("sync", (if dev.sync() then 1 else 0))
+    let base = hal.block.region_start()
+    let unit = dev.block_size()
+    let whole = hal.block.region_bytes()
+    line("partition misaligned", regionflash.region_flash_at(base + unit / 2, unit).block_count())
+    line("partition past region", regionflash.region_flash_at(base, whole + unit).block_count())
+    line("partition below region", regionflash.region_flash_at(base - unit, unit).block_count())
+    line("partition empty", regionflash.region_flash_at(base, 0).block_count())
+    line("partition top unit", regionflash.region_flash_at(base + whole - unit, unit).block_count())
+    match nvfs.mount(regionflash.region_flash_at(base, 0)).mounted()
+        MOk(info) => word("mount of no blocks", "mounted")
+        MErr(e)   => word("mount of no blocks", nvfs.err_str(e))
+
+// The name of fill file `i`.  A string built at run time comes from the
+// arena, which the tier admits in a `system` block; it goes back to the
+// arena when the call that used it returns.
+fn fill_name(i: Int) -> Str
+    var s = ""
+    system
+        s = "/f" + str.from_int(i)
+    s
+
+fn stage1(vol: Volume<RegionFlash>) [hw, mutate]
+    hal.uart.write("stage 1\n")
+    line("after reset a", matching(vol, "/a", A_LEN, 1))
+    line("after reset b", matching(vol, "/b", B_LEN, 2))
+    line("after reset c", matching(vol, "/c", C_LEN, 3))
+    word("remove a", nvfs.err_str(vol.remove("/a")))
+    match vol.stat("/a")
+        EntOk(en) => word("a after remove", "found")
+        EntErr(e) => word("a after remove", nvfs.err_str(e))
+    line("b after remove", matching(vol, "/b", B_LEN, 2))
+    line("used blocks before fill", vol.used_blocks())
+    let len = if vol.info().block_count > 3
+        FILL_BLOCK_LEN
+    else
+        FILL_INLINE_LEN
+    var n = 0
+    var last = EOk
+    let fill_t0 = hal.timer.ticks()
+    for i in 0..FILL_MAX
+        last = vol.file_write(fill_name(i), Pat { n: len, seed: i })
+        if last != EOk
+            break
+        n = n + 1
+    line("fill ms", hal.timer.ticks() - fill_t0)
+    line("fill files", n)
+    line("fill bytes", n * len)
+    word("fill refusal", nvfs.err_str(last))
+    line("used blocks full", vol.used_blocks())
+    line("b when full", matching(vol, "/b", B_LEN, 2))
+    var removed = 0
+    let remove_t0 = hal.timer.ticks()
+    for i in 0..n
+        if vol.remove(fill_name(i)) == EOk
+            removed = removed + 1
+    line("remove ms", hal.timer.ticks() - remove_t0)
+    line("fill removed", removed)
+    line("used blocks after", vol.used_blocks())
+    line("heap after fill", core.rt.heap_alloced())
+    line("pl write", (if vol.file_write("/pl", Word { v: 7 }) == EOk then 1 else 0))
+    line("stage write", (if vol.file_write("/stage", Word { v: 2 }) == EOk then 1 else 0))
+    hal.uart.write("tearing pl=8\n")
+    // The cutting device takes over the region: the volume gives it
+    // back, and a volume on CutFlash writes the record it cuts.
+    let cut = nvfs.mount(CutFlash { dev: vol.unmount(), cut: 1 })
+    let _ = cut.file_write("/pl", Word { v: 8 })
+    hal.uart.write("the cut did not happen\n")
+
+fn stage2(vol: Volume<RegionFlash>) [hw, mutate]
+    hal.uart.write("stage 2\n")
+    line("pl after cut", number(vol, "/pl"))
+    line("b after cut", matching(vol, "/b", B_LEN, 2))
+    line("c after cut", matching(vol, "/c", C_LEN, 3))
+    line("entries after cut", entries(vol))
+    line("pl write after cut", (if vol.file_write("/pl", Word { v: 9 }) == EOk then 1 else 0))
+    line("pl", number(vol, "/pl"))
+    line("stage write", (if vol.file_write("/stage", Word { v: 3 }) == EOk then 1 else 0))
+    hal.uart.write("loop\n")
+    for i in 10..1000000
+        let _ = vol.file_write("/pl", Word { v: i })
+        let _ = vol.file_write("/p2", Word { v: i })
+    hal.uart.write("loop ended\n")
+
+fn stage3(vol: Volume<RegionFlash>) [hw, mutate]
+    hal.uart.write("stage 3\n")
+    let pl = number(vol, "/pl")
+    let p2 = number(vol, "/p2")
+    line("pl after reset", pl)
+    line("p2 after reset", p2)
+    line("loop ran", (if pl >= 10 then 1 else 0))
+    line("loop consistent", (if p2 == pl or p2 == pl - 1 then 1 else 0))
+    line("b after reset", matching(vol, "/b", B_LEN, 2))
+    line("c after reset", matching(vol, "/c", C_LEN, 3))
+    line("entries", entries(vol))
+    line("stage write", (if vol.file_write("/stage", Word { v: 4 }) == EOk then 1 else 0))
+    line("digest", devtools.digest(vol, 0, 1, 0))
+    line("block size", vol.info().block_size)
+    line("block count", vol.info().block_count)
+
+fn run() [hw, mutate]
+    let dev = regionflash.region_flash()
+    hal.uart.write("novofs bench\n")
+    line("region start", hal.block.region_start())
+    line("region bytes", hal.block.region_bytes())
+    line("erase size", hal.block.erase_size())
+    line("write size", hal.block.write_size())
+    line("blocks", dev.block_count())
+    let vol = nvfs.mount(dev)
+    match vol.mounted()
+        MErr(e)   =>
+            match e
+                ENoFs => stage0(vol.unmount())
+                _     => word("mount at boot", nvfs.err_str(e))
+        MOk(info) =>
+            let st = number(vol, "/stage")
+            line("stage found", st)
+            if st == 1
+                stage1(vol)
+            else if st == 2
+                stage2(vol)
+            else if st == 3
+                stage3(vol)
+    hal.uart.write("probe done\n")
+
+fn main() [hw, mutate]
+    paint()
+    bsp.board.init()
+    line("stack after init", stack_depth())
+    run()
+    loop
+        pass

@@ -1,0 +1,258 @@
+// The rules a configuration and a device geometry must meet, and the
+// layout details below the volume: paths, the read cache's windows,
+// the kept scans, records a scan rejects, devices with small and large
+// pages and blocks, the allocator's retries and its walk's bounds.
+
+use std.test
+use std.bytes
+
+use flash
+use hostdev
+use meta
+use nvfs
+use hostfs
+
+fn want(got: FsError, exp: FsError)
+    test.assert_eq_str(nvfs.err_str(got), nvfs.err_str(exp))
+
+fn pattern(n: Int, seed: Int) -> Bytes
+    bytes.from_byte_list(list.map(list.range(0, n), i => (seed + i) % 251))
+
+fn ram(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash [mutate, ffi]
+    ram_recycle()
+    nvfs.wear_reset()
+    hostdev.ram_flash(rs, ps, bs, bc)
+
+fn read_all<D: Flash[e]>(vol: Volume<D>, p: Str) -> Bytes [mutate, e]
+    match hostfs.file_read(vol, p)
+        FOk(b)  => b
+        FErr(e) => bytes.from_byte_list([255, 255, 255])
+
+fn cfg(cache: Int, la: Int, nmax: Int, imax: Int, fmax: Int, cycles: Int) -> FsConfig
+    FsConfig { block_cycles: cycles, cache_size: cache, lookahead_size: la,
+               name_max: nmax, file_max: fmax, inline_max: imax }
+
+// A device with the geometry given and no storage; validate reads only
+// the geometry.
+fn geom(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash
+    RamFlash { h: -1, rs: rs, ps: ps, bs: bs, bc: bc }
+
+// ── Validation ──────────────────────────────────────────────────────
+
+@test
+fn test_validate_checks_the_device_geometry()
+    let c = nvfs.default_config()
+    want(nvfs.validate(geom(16, 16, 512, 16), c), EOk)
+    want(nvfs.validate(geom(0, 16, 512, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(16, 0, 512, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(16, 16, 0, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(1024, 16, 2048, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(16, 1024, 2048, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(16, 48, 512, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(48, 16, 512, 16), c), EInvalidConfig)
+    want(nvfs.validate(geom(16, 16, 512, 1), c), EInvalidConfig)
+    // the revision page and one superblock record must fit a block
+    want(nvfs.validate(geom(16, 16, 48, 16), c), EInvalidConfig)
+
+@test
+fn test_validate_checks_the_configuration()
+    let g = geom(16, 16, 512, 16)
+    let m = 2147483647
+    want(nvfs.validate(g, cfg(8, 16, 64, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(24, 16, 64, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(528, 16, 64, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 0, 64, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 0, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 256, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 64, -1, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 64, 300, m, 100)), EInvalidConfig)
+    // the largest dirent record must fit a buffer
+    want(nvfs.validate(g, cfg(512, 16, 255, 512, m, 100)), EInvalidConfig)
+    // so must the largest rename record
+    want(nvfs.validate(g, cfg(256, 16, 255, 4, m, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 64, 4, -1, 100)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 64, 4, m, -2)), EInvalidConfig)
+    want(nvfs.validate(g, cfg(256, 16, 64, 4, m, 0)), EInvalidConfig)
+    // an inline threshold below 8 bytes is sized as 8
+    want(nvfs.validate(g, cfg(256, 16, 64, 4, m, -1)), EOk)
+
+// ── Paths ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_component_past_the_last_is_empty()
+    let s = nvfs.comp_span("/a/b", 5)
+    test.assert_eq(s.hi - s.lo, 0)
+    let l = nvfs.last_span("/")
+    test.assert_eq(l.hi - l.lo, 0)
+
+// ── Sources ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_empty_source()
+    let s = flash.no_src()
+    test.assert_eq(s.src_len(), 0)
+    test.assert_eq(s.src_at(3), 0)
+
+// ── The read cache and the kept scans ───────────────────────────────
+
+@test
+fn test_reads_outside_a_block_answer_minus_one()
+    let dev = ram(16, 16, 512, 4)
+    meta.cache_drop()
+    test.assert_eq(meta.rd8(dev, 0, -1), -1)
+    test.assert_eq(meta.rd8(dev, 0, 512), -1)
+    test.assert_eq(meta.rd16(dev, 0, 511), -1)
+    test.assert_eq(meta.rd32(dev, 0, 510), -1)
+    test.assert_eq(meta.rd8(dev, 9, 0), -1)
+    test.assert_eq(meta.crc_range(dev, 9, 0, 8), -1)
+    // a device whose read unit is wider than a short window
+    let wide = ram(64, 16, 512, 4)
+    meta.cache_drop()
+    test.assert_eq(meta.rd_win(wide, 0, 70, 32), 255)
+
+@test
+fn test_a_scan_filed_over_a_kept_one_replaces_it()
+    let dev = ram(16, 16, 512, 4)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    meta.cache_drop()
+    let s0 = meta.scan(dev, 0)
+    let s1 = meta.scan(dev, 1)
+    test.assert(s0.valid)
+    test.assert_false(s1.valid, "block 1 is erased")
+    let note = meta.scan_of(7, 64, 16)
+    meta.scan_note(0, note)
+    test.assert_eq(meta.scan(dev, 0).rev as Int, 7)
+    meta.scan_note(1, note)
+    test.assert_eq(meta.scan(dev, 1).rev as Int, 7)
+    // a third block takes the older place, then the other
+    let _ = meta.scan(dev, 2)
+    let _ = meta.scan(dev, 3)
+    test.assert_eq(meta.scan(dev, 2).rev as Int, 0)
+
+@test
+fn test_ownership_of_the_kept_state()
+    meta.cache_drop()
+    test.assert(meta.claim(41))
+    test.assert_false(meta.claim(41), "the owner claims again")
+    test.assert_false(meta.release(42), "a volume that does not own it")
+    test.assert(meta.release(41))
+
+// ── Records a scan rejects ──────────────────────────────────────────
+
+@test
+fn test_a_record_longer_than_its_block_ends_the_log()
+    let dev = ram(16, 16, 512, 4)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    // a header claiming 511 bytes of payload after the superblock
+    let _ = hostdev.prog_bytes(dev, 0, 64, bytes.from_byte_list([2, 0, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+    meta.cache_drop()
+    let s = meta.scan_block(dev, 0)
+    test.assert(s.valid)
+    test.assert(s.torn)
+    test.assert_eq(s.limit as Int, 56)
+    test.assert_eq(s.end_off as Int, 512)
+    // the volume still mounts and writes go to the sibling
+    let vol = nvfs.mount(dev)
+    want(vol.status(), EOk)
+    want(hostfs.file_write(vol, "/a", pattern(5, 0)), EOk)
+    test.assert_eq(vol.info().active_meta, 0)
+    let again = nvfs.mount(vol.unmount())
+    test.assert_eq(again.info().active_meta, 1)
+    test.assert_eq(read_all(again, "/a"), pattern(5, 0))
+
+// ── Pages and blocks of other sizes ─────────────────────────────────
+
+@test
+fn test_a_device_with_four_byte_pages()
+    let dev = ram(4, 4, 512, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    test.assert_eq(meta.meta_off(dev), 4)
+    let vol = nvfs.mount(dev)
+    want(vol.mkdir("/d"), EOk)
+    want(hostfs.file_write(vol, "/d/a", pattern(300, 1)), EOk)
+    for i in 0..8
+        want(hostfs.file_write(vol, "/s", pattern(90, i)), EOk)
+    test.assert_eq(read_all(vol, "/d/a"), pattern(300, 1))
+    test.assert_eq(read_all(vol, "/s"), pattern(90, 7))
+
+@test
+fn test_a_device_with_blocks_larger_than_a_buffer()
+    let dev = ram(16, 16, 2048, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let vol = nvfs.mount(dev)
+    want(hostfs.file_write(vol, "/big", pattern(5000, 3)), EOk)
+    test.assert_eq(read_all(vol, "/big"), pattern(5000, 3))
+    want(vol.file_truncate("/big", 2100), EOk)
+    test.assert_eq(read_all(vol, "/big"), pattern(2100, 3))
+
+@test
+fn test_a_long_chain_of_renames_in_one_block()
+    let dev = ram(16, 16, 4096, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let vol = nvfs.mount(dev)
+    want(hostfs.file_write(vol, "/a", pattern(9, 9)), EOk)
+    for i in 0..20
+        want(vol.rename("/a", "/b"), EOk)
+        want(vol.rename("/b", "/a"), EOk)
+    test.assert_eq(read_all(vol, "/a"), pattern(9, 9))
+
+// ── The allocator ───────────────────────────────────────────────────
+
+@test
+fn test_mkdir_retires_a_block_that_will_not_erase_and_retries()
+    // every data block refuses to erase: three attempts, then an error
+    let dev = ram(16, 16, 512, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    for b in 2..16
+        hostdev.ram_mark_bad(b)
+    want(nvfs.mount(dev).mkdir("/d"), EIo)
+    // one bad block among good ones: the retry takes another
+    for bad in 2..16
+        let d2 = ram(16, 16, 512, 16)
+        want(nvfs.format(d2, nvfs.default_config()), EOk)
+        hostdev.ram_mark_bad(bad)
+        let vol = nvfs.mount(d2)
+        want(vol.mkdir("/d"), EOk)
+        want(vol.mkdir("/e"), EOk)
+        want(hostfs.file_write(vol, "/e/f", pattern(10, 0)), EOk)
+
+@test
+fn test_a_chain_retires_blocks_that_will_not_erase()
+    let dev = ram(16, 16, 512, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    for b in 2..16
+        hostdev.ram_mark_bad(b)
+    want(hostfs.file_write(nvfs.mount(dev), "/c", pattern(700, 0)), EIo)
+    for bad in 2..16
+        let d2 = ram(16, 16, 512, 16)
+        want(nvfs.format(d2, nvfs.default_config()), EOk)
+        hostdev.ram_mark_bad(bad)
+        let vol = nvfs.mount(d2)
+        want(hostfs.file_write(vol, "/c", pattern(1500, 0)), EOk)
+        test.assert_eq(read_all(vol, "/c"), pattern(1500, 0))
+
+@test
+fn test_a_two_block_device_has_room_for_inline_files_only()
+    // a mount of a larger device first moves the allocator's cursor
+    let big = ram(16, 16, 512, 64)
+    want(nvfs.format(big, nvfs.default_config()), EOk)
+    let _ = nvfs.mount(big)
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 2)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let vol = nvfs.mount(dev)
+    want(hostfs.file_write(vol, "/s", pattern(20, 0)), EOk)
+    want(vol.mkdir("/d"), ENoSpace)
+    want(hostfs.file_write(vol, "/c", pattern(200, 0)), ENoSpace)
+
+@test
+fn test_a_directory_that_contains_itself_does_not_hold_the_walk()
+    let dev = ram(16, 16, 512, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let s = Spec { rtype: 2, kind: 1, a: Span { lo: 1, hi: 5 }, b: Span { lo: 0, hi: 0 }, p0: 0, p1: 1 }
+    var stage: Buf = Vec.new()
+    want(nvfs.commit(dev, 0, 1, s, "/loop", "/loop", stage), EOk)
+    let vol = nvfs.mount(dev)
+    test.assert_eq(vol.used_blocks(), 2)
+    want(hostfs.file_write(vol, "/loop/loop/f", pattern(700, 0)), EOk)
+    test.assert_eq(read_all(vol, "/f"), pattern(700, 0))

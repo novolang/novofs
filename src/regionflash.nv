@@ -1,0 +1,150 @@
+// src/regionflash.nv: a partition of a board's reserved
+// flash region as a Flash device, over `hal.block`'s region surface.
+//
+// A board with a flash driver names it for `hal.block` and states the
+// bytes it may erase and write, `block_region` in its manifest, or the
+// data region of its `[flash]` table, which names the same bytes.  The
+// region surface reaches those bytes by offset, in the units the flash
+// erases and programs: `hal.block.erase_size()` and `write_size()`,
+// `read_at(off, n)`, `write_at(off, n)` and `erase_at(off)`, with the
+// bytes crossing through the device's 512-byte staging buffer.  Under
+// QEMU's MPS2 machines the same surface reaches a file on the host, in
+// blocks of 512 bytes.
+//
+// One novofs block is one erase unit.  A metadata pair is two blocks
+// the filesystem erases one at a time, and a block is erased only when
+// nothing in it is live, so a block must be a unit the flash erases on
+// its own: 4096 bytes on the nRF52, 131072 on the STM32F407's top
+// sectors, 512 under QEMU.  Inside a block the filesystem appends: each
+// prog programs a few bytes of a unit already erased, and the driver
+// only clears bits.  Nothing is erased and programmed again in one
+// operation, so a reset in the middle of a prog loses at most the bytes
+// of that prog, which the record's checksum then rejects.
+//
+// What the mapping costs: the smallest file that does not fit inline in
+// its directory record takes a whole unit, and a compaction erases a
+// whole unit (85 ms on the nRF52, about a second on the STM32F407).  A
+// volume needs two units for its metadata pair and one more for each
+// file stored outside its record.
+//
+// The device reports a page of 16 bytes, or the flash's write unit when
+// that is larger, for reads and progs, so every prog is a whole number
+// of write units and the layout matches the images the host tool and
+// the QEMU gate write with 16-byte pages.
+//
+// Effects: `impl Flash[hw]`.  The device keeps no state of its own; its
+// fields are fixed when it is made.  Nothing here allocates.
+
+use flash
+
+// The smallest page the device reports.
+let REGION_PAGE = 16
+
+// A partition of the board's reserved region: `off` bytes from the
+// region's start, `count` blocks of `unit` bytes, read and programmed
+// in pages of `page` bytes.
+@value
+struct RegionFlash
+    off: Int
+    count: Int
+    unit: Int
+    page: Int
+
+// The page the region's flash programs in: 16 bytes, or its write unit
+// when that is larger.
+@tier(embedded)
+fn region_page() -> Int [hw]
+    let w = hal.block.write_size()
+    if w > REGION_PAGE
+        // cov: skip — runs only on a board whose flash writes more than 16 bytes at a time; the host's region writes none
+        w
+    else
+        REGION_PAGE
+
+// The whole reserved region as one partition: on a board, the bytes its
+// manifest names: its `block_region`, or the data region of its `[flash]`
+// table, which a bootloader never writes.
+pub @tier(embedded)
+fn region_flash() -> RegionFlash [hw]
+    region_flash_at(hal.block.region_start(), hal.block.region_bytes())
+
+// The partition of `size` bytes from the address `start`, which must lie
+// inside the reserved region and start and end on erase units.  A
+// partition that does not has no blocks, and a mount of it is refused.
+pub @tier(embedded)
+fn region_flash_at(start: Int, size: Int) -> RegionFlash [hw]
+    let base = hal.block.region_start()
+    let unit = hal.block.erase_size()
+    let off = start - base
+    let page = region_page()
+    let fits = off >= 0 and size > 0 and off + size <= hal.block.region_bytes()
+    if unit <= 0 or not fits or off % unit != 0 or size % unit != 0
+        return RegionFlash { off: 0, count: 0, unit: 0, page: page }
+    // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+    RegionFlash { off: off, count: size / unit, unit: unit, page: page }
+
+impl Flash[hw] for RegionFlash
+    @tier(embedded)
+    fn read_size(self) -> Int
+        self.page
+
+    @tier(embedded)
+    fn prog_size(self) -> Int
+        self.page
+
+    @tier(embedded)
+    fn block_size(self) -> Int
+        self.unit
+
+    @tier(embedded)
+    fn block_count(self) -> Int
+        self.count
+
+    // Replaces `dst`'s contents with the `len` bytes at (block, off).
+    @tier(embedded)
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [hw]
+        dst.clear()
+        if not self.holds(block, off, len)
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        if hal.block.read_at(self.off + block * self.unit + off, len) != 0
+            // cov: skip — runs only when the storage refuses a read inside the region, which a chip's memory-mapped flash never does; `holds` has refused every read outside it
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        for i in 0..len
+            let _ = dst.push((hal.block.buf_get(i) & 255) as u8)
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        true
+
+    // Programs `src`'s bytes at (block, off), clearing bits only.
+    @tier(embedded)
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [hw]
+        let len = src.len()
+        if not self.holds(block, off, len)
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        for i in 0..len
+            hal.block.buf_set(i, src[i] as Int)
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        hal.block.write_at(self.off + block * self.unit + off, len) == 0
+
+    @tier(embedded)
+    fn erase(self, block: Int) -> Bool [hw]
+        if block < 0 or block >= self.count
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        hal.block.erase_at(self.off + block * self.unit) == 0
+
+    @tier(embedded)
+    fn sync(self) -> Bool
+        true
+
+impl RegionFlash
+    // Whether `len` bytes at (block, off) are inside one block of the
+    // partition, on whole pages, and fit a Buf.
+    @tier(embedded)
+    fn holds(self, block: Int, off: Int, len: Int) -> Bool
+        if block < 0 or block >= self.count or off < 0 or len < 0 or len > BUF_CAP
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        off + len <= self.unit and off % self.page == 0 and len % self.page == 0

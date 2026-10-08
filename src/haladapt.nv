@@ -1,0 +1,176 @@
+// src/haladapt.nv — hal.BlockDevice → novofs Flash
+// adapter.
+//
+// BlockDevice (embedded-hal-nv's embedded_hal module) moves WHOLE blocks:
+// read_block / write_block / erase_block with no sub-block offsets, each
+// through a `Vec[u8; 512]` the caller owns, so a block is at most 512
+// bytes here.
+// novofs's Flash trait wants page-granular prog.  The adapter
+// bridges by reporting a small prog page (BD_PAGE) and implementing
+// prog() as a NOR-preserving read-modify-write:
+//
+//   read_block → AND the incoming bytes into the block image at
+//   the offset (prog can only clear bits, exactly like RamFlash) →
+//   erase_block → write_block.
+//
+// BD_PAGE is small on purpose.  Reporting prog_size == block_size —
+// which is what the device actually does — is UNWORKABLE: novofs lays
+// records out starting at max(4, prog_size), so a block-sized prog
+// page would leave zero bytes of record space in every block.  The
+// small RMW page keeps layouts sane;
+// the cost is one erase per prog, so wear on block-device-backed
+// volumes is driven by write count, not write bytes.  Real flash
+// should implement Flash natively — this adapter is for SD/RAM-
+// class whole-block devices, exactly as block.nv anticipates.
+//
+// RamBlock below is the in-tree reference BlockDevice impl (also
+// the hal trait's first impl anywhere) — ArrayI8-backed like
+// RamFlash, host-side.  BlockFlash holds `bd: dyn BlockDevice`, so
+// ANY BlockDevice impl (a BSP's flash driver, an SD card) adapts
+// without a new wrapper type.
+
+use std.bits
+use std.bytes
+
+use flash
+
+let BD_PAGE = 16   // prog page the adapter reports
+
+@tier(app)
+@ffi("novo_array_i8_alloc")
+fn bd_a8_alloc(capacity: Int) -> Int [ffi]
+@tier(app)
+@ffi("novo_array_i8_get")
+fn bd_a8_get(h: Int, i: Int) -> Int [ffi]
+@tier(app)
+@ffi("novo_array_i8_set")
+fn bd_a8_set(h: Int, i: Int, v: Int) [ffi]
+
+// ── RamBlock — reference hal.BlockDevice impl ───────────────────────
+
+struct RamBlock
+    h: Int
+    bs: Int
+    bc: Int
+
+// A RamBlock of `block_count` blocks of `block_size` bytes, every byte
+// erased to 0xFF.  A block is at most 512 bytes: a larger one is refused
+// by every read.
+pub @tier(app)
+fn ram_block(block_size: Int, block_count: Int) -> RamBlock [ffi]
+    let h = bd_a8_alloc(block_size * block_count)
+    for i in 0..block_size * block_count
+        bd_a8_set(h, i, 255)
+    RamBlock { h: h, bs: block_size, bc: block_count }
+
+impl BlockDevice for RamBlock
+    @tier(app)
+    fn block_size(self) -> Int [hw]
+        self.bs
+
+    @tier(app)
+    fn block_count(self) -> Int [hw]
+        self.bc
+
+    @tier(app)
+    fn read_block(self, block: Int, var dst: Vec[u8; 512]) -> Bool [hw, ffi]
+        dst.clear()
+        if block < 0 or block >= self.bc or self.bs > 512
+            false
+        else
+            for i in 0..self.bs
+                let v = bits.band(bd_a8_get(self.h, block * self.bs + i), 255)
+                let _ = dst.push(v as u8)
+            true
+
+    @tier(app)
+    fn write_block(self, block: Int, var src: Vec[u8; 512]) -> Bool [hw, ffi]
+        if block < 0 or block >= self.bc or src.len() != self.bs
+            false
+        else
+            for i in 0..self.bs
+                bd_a8_set(self.h, block * self.bs + i, bits.band(src[i] as Int, 255))
+            true
+
+    @tier(app)
+    fn erase_block(self, block: Int) -> Bool [hw, ffi]
+        if block < 0 or block >= self.bc
+            false
+        else
+            for i in 0..self.bs
+                bd_a8_set(self.h, block * self.bs + i, 255)
+            true
+
+// ── the adapter: any BlockDevice-shaped device as a Flash ───────────
+
+struct BlockFlash
+    bd: dyn BlockDevice
+
+// Any BlockDevice as a Flash device, with a 16-byte page for reads and
+// progs.  Each prog reads its block, ANDs the new bytes into it, erases
+// the block and writes it back, so a prog costs one erase.
+pub @tier(app)
+fn block_flash(bd: dyn BlockDevice) -> BlockFlash
+    BlockFlash { bd: bd }
+
+impl Flash[hw, ffi] for BlockFlash
+    @tier(app)
+    fn read_size(self) -> Int
+        BD_PAGE
+
+    @tier(app)
+    fn prog_size(self) -> Int
+        BD_PAGE
+
+    @tier(app)
+    fn block_size(self) -> Int [hw, ffi]
+        let bd = self.bd
+        bd.block_size()
+
+    @tier(app)
+    fn block_count(self) -> Int [hw, ffi]
+        let bd = self.bd
+        bd.block_count()
+
+    @tier(app)
+    fn read(self, blk: Int, off: Int, len: Int, var dst: Buf) -> Bool [hw, ffi]
+        dst.clear()
+        let bd = self.bd
+        let bs = bd.block_size()
+        if off < 0 or len < 0 or len > BUF_CAP or off + len > bs or off % BD_PAGE != 0 or len % BD_PAGE != 0
+            false
+        else
+            var cur: Vec[u8; 512] = Vec.new()
+            if not bd.read_block(blk, cur)
+                return false
+            for i in off..off + len
+                let _ = dst.push(cur[i])
+            true
+
+    @tier(app)
+    fn prog(self, blk: Int, off: Int, var data: Buf) -> Bool [hw, ffi]
+        let bd = self.bd
+        let bs = bd.block_size()
+        let len = data.len()
+        if off < 0 or off + len > bs or off % BD_PAGE != 0 or len % BD_PAGE != 0
+            false
+        else
+            var img: Vec[u8; 512] = Vec.new()
+            if not bd.read_block(blk, img)
+                return false
+            // NOR-preserving merge: AND incoming bits into the image
+            for i in off..off + len
+                img[i] = bits.band(img[i] as Int, data[i - off] as Int) as u8
+            if bd.erase_block(blk)
+                bd.write_block(blk, img)
+            else
+                false
+
+    @tier(app)
+    fn erase(self, blk: Int) -> Bool [hw, ffi]
+        let bd = self.bd
+        bd.erase_block(blk)
+
+    @tier(app)
+    fn sync(self) -> Bool
+        true

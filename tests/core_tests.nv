@@ -1,0 +1,54 @@
+// The core's pure parts: the CRC, the record sizes, the path
+// components, the skip-list geometry and the default configuration.
+// The other suites in this directory drive whole volumes.
+
+use std.test
+
+use crc32
+use meta
+use nvfs
+
+fn crc_of(s: Str) -> Int
+    var c = 0xFFFFFFFF
+    for i in 0..str.len(s)
+        c = crc32.update(c, str.byte_at_or(s, i, 0))
+    c ^ 0xFFFFFFFF
+
+@test
+fn test_crc32c_check_value()
+    // the CRC-32C catalogue's check value for "123456789"
+    test.assert_eq(crc_of("123456789"), 0xE3069283)
+
+@test
+fn test_a_record_pads_to_the_prog_page()
+    test.assert_eq(meta.rec_size(32, 16), 48)
+    test.assert_eq(meta.rec_size(8, 16), 16)
+    test.assert_eq(meta.rec_size(9, 1), 17)
+    test.assert_eq(meta.align_up(52, 16), 64)
+
+@test
+fn test_path_components_drop_empty_ones()
+    test.assert_eq(nvfs.comp_count("/a//b/"), 2)
+    test.assert_eq(nvfs.comp_count("a/b"), 2)
+    test.assert_eq(nvfs.comp_count("/"), 0)
+    let s = nvfs.comp_span("/ab//cd", 1)
+    test.assert_eq(s.lo as Int, 5)
+    test.assert_eq(s.hi as Int, 7)
+    let leaf = nvfs.last_span("/x/yz")
+    test.assert_eq(leaf.hi - leaf.lo, 2)
+
+@test
+fn test_the_skip_list_geometry()
+    // 8 blocks need 4 pointer slots (jumps of 1, 2, 4, 8)
+    test.assert_eq(nvfs.ctz_k(8), 4)
+    test.assert_eq(nvfs.ctz_cap(512, 8), 496)
+    test.assert_eq(nvfs.ctz_nblocks(0, 496), 0)
+    test.assert_eq(nvfs.ctz_nblocks(497, 496), 2)
+
+@test
+fn test_the_default_config_and_its_error_names()
+    let c = nvfs.default_config()
+    test.assert_eq(c.inline_max, 128)
+    test.assert_eq(c.name_max, 64)
+    test.assert_eq(nvfs.err_str(ENoSpace), "no space")
+    test.assert_eq(nvfs.err_str(EOk), "ok")

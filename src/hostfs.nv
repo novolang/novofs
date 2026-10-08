@@ -1,0 +1,166 @@
+// src/hostfs.nv — the host's view of a volume: `Bytes`
+// in, `Bytes` and lists out.
+//
+// The core in nvfs.nv writes a file from a `ByteSrc` and reads one
+// into a fixed `Buf`, so that it runs in fixed memory on a device.  A
+// host program wants a whole file as a `Bytes` and a directory as a
+// list, and these wrappers give it that over a mounted volume's
+// methods: the image tool, the FileSystem surface in vfs.nv and the
+// host test suites use them.  A device build does not use this module.
+
+use std.bytes
+use std.list
+
+use flash
+use crc32
+use nvfs
+
+// ── A Bytes as a ByteSrc ────────────────────────────────────────────
+
+struct BytesSrc
+    b: Bytes
+
+impl ByteSrc for BytesSrc
+    @tier(app)
+    fn src_len(self) -> Int
+        bytes.len(self.b)
+
+    @tier(app)
+    fn src_at(self, i: Int) -> Int
+        bytes.byte_at(self.b, i) ?? 0
+
+// `b` as a source of bytes, for a volume's `file_write` and
+// `file_append`.
+pub @tier(app)
+fn src(b: Bytes) -> BytesSrc
+    BytesSrc { b: b }
+
+// ── Entries and results ─────────────────────────────────────────────
+
+// pair0/pair1 are kind-dependent: DIR → child metadata pair blocks;
+// FILE_CTZ → head data-block id + byte size; FILE_INLINE → unused
+// (data carries the content).
+struct DirEntry
+    name: Str
+    kind: Int
+    pair0: Int
+    pair1: Int
+    data: Bytes
+
+// byte size of a file entry (dirs return 0)
+pub @tier(app)
+fn entry_size(e: DirEntry) -> Int
+    if (e.kind as Int) == KIND_FILE_INLINE
+        bytes.len(e.data)
+    else if (e.kind as Int) == KIND_FILE_CTZ
+        e.pair1 as Int
+    else
+        0
+
+enum DirListRes
+    DLOk(entries: [DirEntry])
+    DLErr(e: FsError)
+
+enum FileRes
+    FOk(data: Bytes)
+    FErr(e: FsError)
+
+@tier(app)
+fn ent_name<D: Flash[e]>(vol: Volume<D>, en: Ent) -> Str [mutate, e]
+    let n = en.name_len as Int
+    var out = bytes.zeros(n)
+    for i in 0..n
+        out = bytes.set_u8(out, i, vol.ent_name_byte(en, i))
+    bytes.to_str(out)
+
+// `len` bytes of an entry from `off`, read a Buf at a time.
+@tier(app)
+fn ent_bytes<D: Flash[e]>(vol: Volume<D>, en: Ent, off: Int, len: Int) -> FileRes [mutate, e]
+    var out = bytes.zeros(len)
+    var buf: Buf = Vec.new()
+    for c in 0..(len + BUF_CAP - 1) / BUF_CAP
+        let at = c * BUF_CAP
+        var n = len - at
+        if n > BUF_CAP
+            n = BUF_CAP
+        let r = vol.ent_read(en, off + at, n, buf)
+        if r != EOk
+            return FErr(r)
+        for k in 0..n
+            out = bytes.set_u8(out, at + k, buf[k] as Int)
+    FOk(out)
+
+@tier(app)
+fn to_entry<D: Flash[e]>(vol: Volume<D>, en: Ent) -> DirEntry [mutate, e]
+    DirEntry { name: ent_name(vol, en), kind: en.kind as Int, pair0: en.pair0 as Int, pair1: en.pair1 as Int,
+               data: inline_data(vol, en) }
+
+@tier(app)
+fn inline_data<D: Flash[e]>(vol: Volume<D>, en: Ent) -> Bytes [mutate, e]
+    if (en.kind as Int) != KIND_FILE_INLINE
+        return bytes.from_byte_list([])
+    match ent_bytes(vol, en, 0, en.size as Int)
+        FOk(d)  => d
+        FErr(x) => bytes.from_byte_list([])
+
+// ── The API over Bytes and lists ────────────────────────────────────
+
+// The entries of the directory `path`, in the order the directory
+// holds them, or why it cannot be listed.  An inline file's entry
+// carries its bytes in `data`.
+pub @tier(app)
+fn dir_list<D: Flash[e]>(vol: Volume<D>, path: Str) -> DirListRes [mutate, e]
+    let o = vol.dir_open(path)
+    if o.err != EOk
+        return DLErr(o.err)
+    var cur = o.cur
+    var es: [DirEntry] = []
+    while true
+        let en = vol.dir_next(cur)
+        if not en.found
+            break
+        es = list.push(es, to_entry(vol, en))
+    DLOk(es)
+
+@tier(app)
+fn read_entry_at<D: Flash[e]>(vol: Volume<D>, en: Ent, off: Int, len: Int) -> FileRes [mutate, e]
+    if (en.kind as Int) == KIND_DIR
+        FErr(EIsDir)
+    else if off < 0 or len < 0 or off + len > nvfs.ent_size(en)
+        FErr(EInvalidConfig)
+    else
+        ent_bytes(vol, en, off, len)
+
+// `len` bytes of the file `fpath` from `off`.  A range past the end of
+// the file answers EInvalidConfig, and a directory EIsDir.
+pub @tier(app)
+fn file_read_at<D: Flash[e]>(vol: Volume<D>, fpath: Str, off: Int, len: Int) -> FileRes [mutate, e]
+    match vol.stat(fpath)
+        EntErr(err) => FErr(err)
+        EntOk(en)   => read_entry_at(vol, en, off, len)
+
+// The whole content of the file `fpath`, or why it cannot be read.
+pub @tier(app)
+fn file_read<D: Flash[e]>(vol: Volume<D>, fpath: Str) -> FileRes [mutate, e]
+    match vol.stat(fpath)
+        EntErr(err) => FErr(err)
+        EntOk(en)   => read_entry_at(vol, en, 0, nvfs.ent_size(en))
+
+// Creates or replaces the file `fpath` with `data`.
+pub @tier(app)
+fn file_write<D: Flash[e]>(vol: Volume<D>, fpath: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_write(fpath, src(data))
+
+// Appends `data` to the file `fpath`; a missing file is created.
+pub @tier(app)
+fn file_append<D: Flash[e]>(vol: Volume<D>, fpath: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_append(fpath, src(data))
+
+// CRC-32C over buf[lo, hi), for a caller that holds the bytes already
+// (the image tool's superblock probe).
+@tier(app)
+fn crc_of_slice(buf: Bytes, lo: Int, hi: Int) -> Int
+    var c = 0xFFFFFFFF
+    for i in lo..hi
+        c = crc32.update(c, bytes.byte_at(buf, i) ?? 0)
+    c ^ 0xFFFFFFFF

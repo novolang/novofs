@@ -1,0 +1,21 @@
+[package]
+name        = "novofs"
+version     = "0.2.0"
+description = "A power-loss-resilient filesystem for NOR flash, written in novo-lang and modelled on littlefs: a Flash trait with RAM, image-file, block-device and board-region devices, copy-on-write metadata pairs, CRC-checked commits, CTZ skip-list files, a mounted volume that owns its device, and an image tool (mk, ls, cat, extract, fsck, df)."
+license     = "Apache-2.0"
+category    = "embedded"
+layer       = "app"
+stability   = "experimental"
+tags        = ["embedded", "filesystem", "flash", "littlefs", "nor", "power-loss"]
+repository  = "https://github.com/novolang/novofs"
+maintainers = ["novo-lang"]
+main        = "src/main.nv"
+# The toolchain floor: `Volume<D: Flash[e]>` binds its bound's effect
+# parameter on a struct's type parameter (SPEC § 5.6, "A struct binds it
+# too"), which 0.20.0 first accepts.
+novo        = ">= 0.20.0"
+
+[dependencies]
+# The BlockDevice trait, from embedded-hal-nv, for the block-device
+# adapter (haladapt.nv), whose read_block fills a caller's buffer.
+embedded-hal-nv = "^0.2.0"

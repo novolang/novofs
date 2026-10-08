@@ -1,0 +1,50 @@
+// src/crc32.nv — CRC-32C (Castagnoli).
+//
+// Every metadata commit record carries a CRC-32C; mount treats a
+// mismatch as the end of valid data in that block (a torn write),
+// which is the whole crash-consistency story.
+//
+// Four bits at a time, through a table of 16 entries that `nibble`
+// answers: two steps per byte where the bitwise form takes eight, and
+// no table in RAM.  A scan checks the CRC of every record in a block,
+// which on a device with 128 KB erase units is most of the time an
+// operation takes, so the step count matters there.
+//
+// Polynomial 0x82F63B78 (reflected CRC-32C, the choice littlefs and
+// SSE4.2's crc32 instruction make).  Int is 64 bits, and every
+// intermediate value stays within 32: the input is masked to a byte,
+// and a logical shift right only shrinks the register.
+//
+// A register starts at 0xFFFFFFFF, takes each byte through `update`,
+// and is finished by XOR with 0xFFFFFFFF.
+
+// The register after four zero bits shifted through a register holding
+// `i` in its low four bits: the 16-entry table of the nibble-wise form.
+@tier(embedded)
+fn nibble(i: Int) -> Int
+    match i
+        0  => 0x00000000
+        1  => 0x105EC76F
+        2  => 0x20BD8EDE
+        3  => 0x30E349B1
+        4  => 0x417B1DBC
+        5  => 0x5125DAD3
+        6  => 0x61C69362
+        7  => 0x7198540D
+        8  => 0x82F63B78
+        9  => 0x92A8FC17
+        10 => 0xA24BB5A6
+        11 => 0xB21572C9
+        12 => 0xC38D26C4
+        13 => 0xD3D3E1AB
+        14 => 0xE330A81A
+        _  => 0xF36E6F75
+
+// The CRC-32C register after `byte` (its low 8 bits) is shifted
+// through `crc`.  Start a register at 0xFFFFFFFF and finish it with an
+// XOR of 0xFFFFFFFF.
+pub @tier(embedded)
+fn update(crc: Int, byte: Int) -> Int
+    let c = crc ^ (byte & 255)
+    let d = (c >>> 4) ^ nibble(c & 15)
+    (d >>> 4) ^ nibble(d & 15)

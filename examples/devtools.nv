@@ -1,0 +1,92 @@
+// examples/devtools.nv — what the device examples share:
+// byte sources, a tree digest, and terse output over the board's UART
+// (semihosting under QEMU).
+//
+// Everything here is legal at `@tier(embedded)`, and apart from the
+// number printing in `num` it allocates nothing, so an example calls
+// the rest from a `@no_alloc` function too.
+
+use flash
+use nvfs
+
+// `n` bytes of a pattern: byte i is (i * 7 + seed) % 251.
+@value
+struct Pat
+    n: Int
+    seed: Int
+
+impl ByteSrc for Pat
+    fn src_len(self) -> Int
+        self.n
+
+    fn src_at(self, i: Int) -> Int
+        (i * 7 + self.seed) % 251
+
+// A little-endian u32 as a four-byte source.
+@value
+struct Word
+    v: Int
+
+impl ByteSrc for Word
+    fn src_len(self) -> Int
+        4
+
+    fn src_at(self, i: Int) -> Int
+        (self.v >>> (8 * i)) & 255
+
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+fn num(n: Int) [hw]
+    hal.uart.write(str.from_int(n))
+
+fn mix(h: Int, x: Int) -> Int
+    (h * 31 + x + 7) % 1000000007
+
+// A digest of the tree under the pair (b0, b1) of a mounted volume:
+// every entry's name, kind and size in listing order, every file's
+// bytes, every subdirectory's digest.  -1 when any part cannot be read.
+fn digest<D: Flash[e]>(vol: Volume<D>, b0: Int, b1: Int, depth: Int) -> Int [mutate, e]
+    if depth > 8
+        return -1
+    let o = vol.dir_open_pair(b0, b1)
+    if o.err != EOk
+        return -1
+    var cur = o.cur
+    var h = 17
+    var buf: Buf = Vec.new()
+    for step in 0..64
+        let en = vol.dir_next(cur)
+        if not en.found
+            break
+        for i in 0..en.name_len as Int
+            h = mix(h, vol.ent_name_byte(en, i))
+        h = mix(h, en.kind as Int)
+        if (en.kind as Int) == KIND_DIR
+            let c = digest(vol, en.pair0 as Int, en.pair1 as Int, depth + 1)
+            if c < 0
+                return -1
+            h = mix(h, c)
+        else
+            let size = nvfs.ent_size(en)
+            h = mix(h, size)
+            var pos = 0
+            for chunk in 0..size / BUF_CAP + 1
+                if pos >= size
+                    break
+                var n = size - pos
+                if n > BUF_CAP
+                    n = BUF_CAP
+                if vol.ent_read(en, pos, n, buf) != EOk
+                    return -1
+                for b in buf
+                    h = mix(h, b as Int)
+                pos = pos + n
+    h
+
+// The root's digest after a mount; -1 when the volume does not mount.
+fn volume_digest<D: Flash[e]>(dev: D) -> Int [mutate, e]
+    let vol: Volume<D> = nvfs.mount(dev)
+    match vol.mounted()
+        MOk(info) => digest(vol, 0, 1, 0)
+        MErr(e)   => -1

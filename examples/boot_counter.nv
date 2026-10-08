@@ -1,0 +1,90 @@
+// examples/boot_counter.nv — the novofs lifecycle on a
+// device: format, mount, increment a counter file, unmount, remount,
+// verify.
+//
+//   novo build --target=nrf52-qemu boot_counter.nv
+//   qemu-system-arm -machine mps2-an386 -nographic -semihosting \
+//       -kernel boot_counter.elf
+//
+// The build needs the novofs modules flash, crc32, meta and nvfs from
+// src/ beside this file, with emram.nv and devtools.nv from this
+// directory; the novo-lang repository's QEMU gate,
+// tests/orbit/test_novofs_qemu.sh, assembles them.
+//
+// The volume is an EmRam device: 16 blocks of 512 bytes in static
+// storage.  Each "boot" mounts the volume, reads /boot/count (absent
+// on the first boot), writes it back one higher and unmounts, which
+// gives the device back.
+// The last line is the pass banner, `novofs-qemu: boot PASS`, or
+// `FAIL` with the step that failed.
+
+use flash
+use nvfs
+use emram
+use devtools
+
+let BOOTS = 5
+
+// The counter read and written back one higher, on a mounted volume.
+// Answers the value written, or -1.  Nothing here allocates; the mount
+// before it makes the volume's one allocation.
+@no_alloc
+fn bump(vol: Volume<EmRam>) -> Int [mutate]
+    var buf: Buf = Vec.new()
+    var count = 0
+    let r = vol.file_read_at("/boot/count", 0, 4, buf)
+    if r == EOk
+        count = buf[0] as Int + buf[1] as Int * 256
+    else if r != ENotFound
+        return -1
+    if vol.file_write("/boot/count", Word { v: count + 1 }) != EOk
+        return -1
+    count + 1
+
+// One boot: mount, bump the counter, unmount.  Answers the value
+// written, or -1.
+fn boot(dev: EmRam) -> Int [mutate]
+    let vol = nvfs.mount(dev)
+    if vol.status() != EOk
+        return -1
+    let n = bump(vol)
+    let _ = vol.unmount()
+    n
+
+fn main() [hw, mutate]
+    bsp.board.init()
+    let dev = emram.emram(16, 16, 512, 16)
+    if nvfs.format(dev, nvfs.default_config()) != EOk
+        devtools.say("novofs-qemu: boot FAIL format\n")
+        return
+    let vol2 = nvfs.mount(dev)
+    match vol2.mounted()
+        MErr(e)   =>
+            devtools.say("novofs-qemu: boot FAIL mount\n")
+            return
+        MOk(info) =>
+            if vol2.mkdir("/boot") != EOk
+                devtools.say("novofs-qemu: boot FAIL mkdir\n")
+                return
+    for i in 0..BOOTS
+        if boot(dev) != i + 1
+            devtools.say("novofs-qemu: boot FAIL at boot ")
+            devtools.num(i + 1)
+            devtools.say("\n")
+            return
+    // remount and verify
+    let vol3 = nvfs.mount(dev)
+    match vol3.mounted()
+        MErr(e)   => devtools.say("novofs-qemu: boot FAIL remount\n")
+        MOk(info) =>
+            let n = vol3.file_size("/boot/count")
+            var buf: Buf = Vec.new()
+            let r = vol3.file_read_at("/boot/count", 0, 4, buf)
+            if n == 4 and r == EOk and (buf[0] as Int) == BOOTS
+                devtools.say("novofs-qemu: boot count ")
+                devtools.num(buf[0] as Int)
+                devtools.say(" after remount, rev ")
+                devtools.num(info.rev)
+                devtools.say("\nnovofs-qemu: boot PASS\n")
+            else
+                devtools.say("novofs-qemu: boot FAIL verify\n")

@@ -1,0 +1,428 @@
+// The mounted volume on a RamFlash: format, mount, the directory
+// operations, files inline and in skip-list chains, and what each
+// operation answers for a path it cannot serve.
+
+use std.test
+use std.bytes
+
+use flash
+use hostdev
+use nvfs
+use hostfs
+
+// A RamFlash of `bc` blocks of 512 bytes, read and programmed in pages
+// of 16 bytes, formatted with the default configuration and mounted.
+fn fresh(bc: Int) -> Volume<RamFlash> [mutate, ffi]
+    ram_recycle()
+    nvfs.wear_reset()
+    let dev = hostdev.ram_flash(16, 16, 512, bc)
+    let _ = nvfs.format(dev, nvfs.default_config())
+    nvfs.mount(dev)
+
+// Fails unless `got` is `exp`, naming both.
+fn want(got: FsError, exp: FsError)
+    test.assert_eq_str(nvfs.err_str(got), nvfs.err_str(exp))
+
+// `n` bytes counting up from `seed`, modulo 251.
+fn pattern(n: Int, seed: Int) -> Bytes
+    bytes.from_byte_list(list.map(list.range(0, n), i => (seed + i) % 251))
+
+fn read_all(vol: Volume<RamFlash>, p: Str) -> Bytes [mutate, ffi]
+    match hostfs.file_read(vol, p)
+        FOk(b)  => b
+        FErr(e) => bytes.from_byte_list([])
+
+fn read_err(vol: Volume<RamFlash>, p: Str) -> FsError [mutate, ffi]
+    match hostfs.file_read(vol, p)
+        FOk(b)  => EOk
+        FErr(e) => e
+
+fn names(vol: Volume<RamFlash>, p: Str) -> Str [mutate, ffi]
+    match hostfs.dir_list(vol, p)
+        DLErr(e) => "err " + nvfs.err_str(e)
+        DLOk(es) =>
+            var s = ""
+            for en in es
+                s = s + en.name + ";"
+            s
+
+@test
+fn test_format_then_mount_reports_the_geometry()
+    let vol = fresh(32)
+    match vol.mounted()
+        MOk(info) =>
+            test.assert_eq(info.block_size, 512)
+            test.assert_eq(info.block_count, 32)
+            test.assert_eq(info.name_max, 64)
+            test.assert_eq(info.inline_max, 128)
+            test.assert_eq(info.block_cycles, 100)
+            test.assert_eq(info.rev, 1)
+            test.assert_eq(info.active_meta, 0)
+        MErr(e)   => test.fail("mount: " + nvfs.err_str(e))
+    want(vol.status(), EOk)
+    test.assert_eq(vol.info().block_count, 32)
+    test.assert_eq(vol.used_blocks(), 2)
+
+@test
+fn test_an_erased_device_has_no_filesystem()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    let vol = nvfs.mount(dev)
+    want(vol.status(), ENoFs)
+    match vol.mounted()
+        MOk(info) => test.fail("mounted an erased device")
+        MErr(e)   => want(e, ENoFs)
+    test.assert_eq(vol.info().block_count, 0)
+
+@test
+fn test_a_one_block_device_does_not_mount()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 1)
+    want(nvfs.mount(dev).status(), EGeometry)
+
+@test
+fn test_a_device_of_another_size_is_refused()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 32)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let smaller = RamFlash { h: dev.h, rs: 16, ps: 16, bs: 512, bc: 16 }
+    want(nvfs.mount(smaller).status(), EGeometry)
+
+@test
+fn test_mount_with_formats_only_an_empty_device()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    want(nvfs.mount_with(dev, nvfs.default_config(), false).status(), ENoFs)
+    let vol = nvfs.mount_with(dev, nvfs.default_config(), true)
+    want(vol.status(), EOk)
+    want(hostfs.file_write(vol, "/keep", pattern(10, 1)), EOk)
+    // a second mount_with finds the volume and leaves it as it is
+    let again = nvfs.mount_with(vol.unmount(), nvfs.default_config(), true)
+    want(again.status(), EOk)
+    test.assert_eq(bytes.len(read_all(again, "/keep")), 10)
+
+@test
+fn test_mount_with_answers_a_format_the_device_refuses()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    hostdev.ram_mark_bad(1)
+    want(nvfs.mount_with(dev, nvfs.default_config(), true).status(), EIo)
+
+@test
+fn test_mount_with_never_formats_over_a_volume_that_does_not_mount()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    want(nvfs.format(dev, nvfs.default_config()), EOk)
+    let smaller = RamFlash { h: dev.h, rs: 16, ps: 16, bs: 512, bc: 8 }
+    want(nvfs.mount_with(smaller, nvfs.default_config(), true).status(), EGeometry)
+
+@test
+fn test_format_answers_an_erase_the_device_refuses()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    hostdev.ram_mark_bad(0)
+    want(nvfs.format(dev, nvfs.default_config()), EIo)
+    ram_recycle()
+    let dev2 = hostdev.ram_flash(16, 16, 512, 16)
+    hostdev.ram_mark_bad(1)
+    want(nvfs.format(dev2, nvfs.default_config()), EIo)
+
+@test
+fn test_format_answers_a_configuration_that_does_not_validate()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    let c = nvfs.default_config()
+    let bad = FsConfig { block_cycles: 0, cache_size: c.cache_size, lookahead_size: c.lookahead_size,
+                         name_max: c.name_max, file_max: c.file_max, inline_max: c.inline_max }
+    want(nvfs.format(dev, bad), EInvalidConfig)
+
+@test
+fn test_format_with_wear_levelling_off_stores_minus_one()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    let c = nvfs.default_config()
+    let off = FsConfig { block_cycles: -1, cache_size: c.cache_size, lookahead_size: c.lookahead_size,
+                         name_max: c.name_max, file_max: c.file_max, inline_max: c.inline_max }
+    want(nvfs.format(dev, off), EOk)
+    test.assert_eq(nvfs.mount(dev).info().block_cycles, -1)
+
+@test
+fn test_the_error_names()
+    test.assert_eq(nvfs.err_str(EOk), "ok")
+    test.assert_eq(nvfs.err_str(EIo), "io error")
+    test.assert_eq(nvfs.err_str(ECorrupt), "corrupt")
+    test.assert_eq(nvfs.err_str(ENoFs), "no filesystem")
+    test.assert_eq(nvfs.err_str(EGeometry), "geometry mismatch")
+    test.assert_eq(nvfs.err_str(EVersion), "version unsupported")
+    test.assert_eq(nvfs.err_str(EInvalidConfig), "invalid config")
+    test.assert_eq(nvfs.err_str(ENoSpace), "no space")
+    test.assert_eq(nvfs.err_str(ENotFound), "not found")
+    test.assert_eq(nvfs.err_str(EExists), "exists")
+    test.assert_eq(nvfs.err_str(ENotDir), "not a directory")
+    test.assert_eq(nvfs.err_str(EIsDir), "is a directory")
+    test.assert_eq(nvfs.err_str(ENotEmpty), "not empty")
+    test.assert_eq(nvfs.err_str(ENameTooLong), "name too long")
+    test.assert_eq(nvfs.err_str(ENotSupported), "not supported")
+
+@test
+fn test_mkdir_and_list()
+    let vol = fresh(32)
+    want(vol.mkdir("/"), EExists)
+    want(vol.mkdir("/a"), EOk)
+    want(vol.mkdir("/a"), EExists)
+    want(vol.mkdir("/a/b"), EOk)
+    want(vol.mkdir("/x/y"), ENotFound)
+    want(hostfs.file_write(vol, "/f", pattern(4, 0)), EOk)
+    want(vol.mkdir("/f/g"), ENotDir)
+    want(vol.mkdir("/" + str.repeat("n", 65)), ENameTooLong)
+    test.assert_eq(names(vol, "/"), "a;f;")
+    test.assert_eq(names(vol, "/a"), "b;")
+    test.assert_eq(names(vol, "/missing"), "err not found")
+    test.assert_eq(vol.used_blocks(), 6)
+
+@test
+fn test_remove()
+    let vol = fresh(32)
+    want(vol.remove("/"), ENotSupported)
+    want(vol.remove("/nothing"), ENotFound)
+    want(vol.remove("/no/thing"), ENotFound)
+    want(vol.mkdir("/d"), EOk)
+    want(hostfs.file_write(vol, "/d/f", pattern(300, 3)), EOk)
+    want(vol.remove("/d"), ENotEmpty)
+    want(vol.remove("/d/f"), EOk)
+    want(vol.remove("/d"), EOk)
+    test.assert_eq(names(vol, "/"), "")
+    test.assert_eq(vol.used_blocks(), 2)
+
+@test
+fn test_rename_within_a_directory()
+    let vol = fresh(32)
+    want(vol.mkdir("/d"), EOk)
+    want(hostfs.file_write(vol, "/d/a", pattern(20, 7)), EOk)
+    want(hostfs.file_write(vol, "/d/b", pattern(5, 1)), EOk)
+    want(vol.rename("/", "/x"), ENotSupported)
+    want(vol.rename("/d/a", "/c"), ENotSupported)
+    want(vol.rename("/d/a", "/dd/a"), ENotSupported)
+    want(vol.rename("/d/a", "/e/a"), ENotSupported)
+    want(vol.rename("/d/a", "/d/" + str.repeat("n", 65)), ENameTooLong)
+    want(vol.rename("/q/a", "/q/b"), ENotFound)
+    want(vol.rename("/d/zz", "/d/yy"), ENotFound)
+    want(vol.rename("/d/a", "/d/b"), EExists)
+    want(vol.rename("/d/a", "/d/c"), EOk)
+    test.assert_eq(names(vol, "/d"), "b;c;")
+    test.assert_eq(read_all(vol, "/d/c"), pattern(20, 7))
+    want(read_err(vol, "/d/a"), ENotFound)
+    // a chain of renames resolves through each record
+    want(vol.rename("/d/c", "/d/e"), EOk)
+    want(vol.rename("/d/e", "/d/a"), EOk)
+    test.assert_eq(read_all(vol, "/d/a"), pattern(20, 7))
+    test.assert_eq(names(vol, "/d"), "b;a;")
+    // the old name written again after a rename away from it
+    want(vol.rename("/d/a", "/d/m"), EOk)
+    want(hostfs.file_write(vol, "/d/a", pattern(3, 9)), EOk)
+    test.assert_eq(read_all(vol, "/d/m"), pattern(20, 7))
+    test.assert_eq(read_all(vol, "/d/a"), pattern(3, 9))
+    // a renamed entry removed, then its new name rewritten
+    want(vol.remove("/d/m"), EOk)
+    test.assert_eq(names(vol, "/d"), "b;a;")
+    want(vol.rename("/d/a", "/d/m"), EOk)
+    want(hostfs.file_write(vol, "/d/m", pattern(4, 4)), EOk)
+    test.assert_eq(names(vol, "/d"), "b;m;")
+    // a directory renamed keeps its entries
+    want(vol.mkdir("/d/sub"), EOk)
+    want(hostfs.file_write(vol, "/d/sub/x", pattern(2, 2)), EOk)
+    want(vol.rename("/d/sub", "/d/sub2"), EOk)
+    test.assert_eq(names(vol, "/d/sub2"), "x;")
+
+@test
+fn test_files_inline_and_in_chains()
+    let vol = fresh(32)
+    // inline: at most inline_max bytes, in the directory record
+    want(hostfs.file_write(vol, "/small", pattern(100, 5)), EOk)
+    test.assert_eq(vol.file_size("/small"), 100)
+    test.assert_eq(read_all(vol, "/small"), pattern(100, 5))
+    // a chain: 2000 bytes over several data blocks
+    want(hostfs.file_write(vol, "/big", pattern(2000, 11)), EOk)
+    test.assert_eq(vol.file_size("/big"), 2000)
+    test.assert_eq(read_all(vol, "/big"), pattern(2000, 11))
+    match hostfs.file_read_at(vol, "/big", 1500, 100)
+        FOk(b)  => test.assert_eq(b, bytes.slice(pattern(2000, 11), 1500, 1600))
+        FErr(e) => test.fail("read_at: " + nvfs.err_str(e))
+    match hostfs.file_read_at(vol, "/big", 1990, 20)
+        FOk(b)  => test.fail("read past the end")
+        FErr(e) => want(e, EInvalidConfig)
+    match hostfs.file_read_at(vol, "/none", 0, 1)
+        FOk(b)  => test.fail("read a missing file")
+        FErr(e) => want(e, ENotFound)
+    // replacing a chain with an inline file frees the chain
+    let before = vol.used_blocks()
+    want(hostfs.file_write(vol, "/big", pattern(3, 0)), EOk)
+    test.assert(vol.used_blocks() < before)
+    // an empty file
+    want(hostfs.file_write(vol, "/empty", bytes.from_byte_list([])), EOk)
+    test.assert_eq(vol.file_size("/empty"), 0)
+    test.assert_eq(bytes.len(read_all(vol, "/empty")), 0)
+
+@test
+fn test_what_a_file_operation_answers_for_a_path_it_cannot_serve()
+    let vol = fresh(32)
+    want(vol.mkdir("/d"), EOk)
+    want(hostfs.file_write(vol, "/", pattern(1, 0)), EIsDir)
+    want(hostfs.file_write(vol, "/d", pattern(1, 0)), EIsDir)
+    want(hostfs.file_write(vol, "/" + str.repeat("n", 65), pattern(1, 0)), ENameTooLong)
+    want(hostfs.file_write(vol, "/x/y", pattern(1, 0)), ENotFound)
+    want(hostfs.file_append(vol, "/d", pattern(1, 0)), EIsDir)
+    want(hostfs.file_append(vol, "/x/y", pattern(1, 0)), ENotFound)
+    want(read_err(vol, "/"), EIsDir)
+    want(read_err(vol, "/d"), EIsDir)
+    want(read_err(vol, "/x/y"), ENotFound)
+    test.assert_eq(vol.file_size("/d"), -1)
+    test.assert_eq(vol.file_size("/none"), -1)
+    want(vol.file_truncate("/none", 1), ENotFound)
+    want(vol.file_truncate("/d", 1), EIsDir)
+    want(vol.file_truncate("/d", -1), EInvalidConfig)
+    var buf: Buf = Vec.new()
+    want(vol.file_read_at("/d", 0, 1, buf), EIsDir)
+    want(vol.file_read_at("/none", 0, 1, buf), ENotFound)
+    match vol.stat("/d")
+        EntOk(en) =>
+            want(vol.ent_read(en, 0, 1, buf), EIsDir)
+            test.assert_eq(nvfs.ent_size(en), 0)
+        EntErr(e) => test.fail("stat /d: " + nvfs.err_str(e))
+    want(hostfs.file_write(vol, "/f", pattern(10, 0)), EOk)
+    match vol.stat("/f")
+        EntOk(en) =>
+            want(vol.ent_read(en, 5, 10, buf), EInvalidConfig)
+            want(vol.ent_read(en, -1, 1, buf), EInvalidConfig)
+            want(vol.ent_read(en, 0, 600, buf), EInvalidConfig)
+            want(vol.ent_read(en, 2, 3, buf), EOk)
+            test.assert_eq(buf.len(), 3)
+            test.assert_eq(buf[0] as Int, 2)
+        EntErr(e) => test.fail("stat /f: " + nvfs.err_str(e))
+
+@test
+fn test_a_file_larger_than_file_max_is_refused()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 32)
+    let c = nvfs.default_config()
+    let cfg = FsConfig { block_cycles: c.block_cycles, cache_size: c.cache_size, lookahead_size: c.lookahead_size,
+                         name_max: c.name_max, file_max: 50, inline_max: c.inline_max }
+    want(nvfs.format(dev, cfg), EOk)
+    let vol = nvfs.mount(dev)
+    want(hostfs.file_write(vol, "/f", pattern(51, 0)), ENoSpace)
+    want(hostfs.file_write(vol, "/f", pattern(50, 0)), EOk)
+
+@test
+fn test_append()
+    let vol = fresh(32)
+    // a missing file is created
+    want(hostfs.file_append(vol, "/log", pattern(50, 0)), EOk)
+    // inline stays inline
+    want(hostfs.file_append(vol, "/log", pattern(50, 50)), EOk)
+    test.assert_eq(read_all(vol, "/log"), pattern(100, 0))
+    // inline grows into a chain
+    want(hostfs.file_append(vol, "/log", pattern(400, 100)), EOk)
+    test.assert_eq(read_all(vol, "/log"), pattern(500, 0))
+    // a chain grows across blocks
+    want(hostfs.file_append(vol, "/log", pattern(1000, 500)), EOk)
+    test.assert_eq(vol.file_size("/log"), 1500)
+    test.assert_eq(read_all(vol, "/log"), pattern(1500, 0))
+
+@test
+fn test_truncate()
+    let vol = fresh(32)
+    want(hostfs.file_write(vol, "/t", pattern(2000, 1)), EOk)
+    want(vol.file_truncate("/t", 2000), EOk)
+    // a chain cut to fewer blocks keeps its prefix
+    want(vol.file_truncate("/t", 1200), EOk)
+    test.assert_eq(read_all(vol, "/t"), pattern(1200, 1))
+    // cut into an inline entry
+    want(vol.file_truncate("/t", 60), EOk)
+    test.assert_eq(read_all(vol, "/t"), pattern(60, 1))
+    // an inline entry cut shorter
+    want(vol.file_truncate("/t", 10), EOk)
+    test.assert_eq(read_all(vol, "/t"), pattern(10, 1))
+    // extended with zeros, into a chain
+    want(vol.file_truncate("/t", 700), EOk)
+    test.assert_eq(vol.file_size("/t"), 700)
+    let got = read_all(vol, "/t")
+    test.assert_eq(bytes.slice(got, 0, 10), pattern(10, 1))
+    test.assert_eq(bytes.byte_at(got, 699) ?? 1, 0)
+    test.assert_eq(bytes.byte_at(got, 10) ?? 1, 0)
+
+@test
+fn test_a_full_volume_refuses_a_write()
+    let vol = fresh(8)
+    // six data blocks of 496 bytes each
+    want(hostfs.file_write(vol, "/a", pattern(2976, 0)), EOk)
+    want(hostfs.file_write(vol, "/b", pattern(500, 0)), ENoSpace)
+    want(vol.mkdir("/d"), ENoSpace)
+    want(vol.remove("/a"), EOk)
+    want(vol.mkdir("/d"), EOk)
+
+@test
+fn test_a_volume_that_did_not_mount_answers_its_error()
+    ram_recycle()
+    let dev = hostdev.ram_flash(16, 16, 512, 16)
+    let vol = nvfs.mount(dev)
+    want(vol.mkdir("/a"), ENoFs)
+    want(vol.remove("/a"), ENoFs)
+    want(vol.rename("/a", "/b"), ENoFs)
+    want(hostfs.file_write(vol, "/a", pattern(1, 0)), ENoFs)
+    want(hostfs.file_append(vol, "/a", pattern(1, 0)), ENoFs)
+    want(vol.file_truncate("/a", 0), ENoFs)
+    test.assert_eq(vol.file_size("/a"), -1)
+    var buf: Buf = Vec.new()
+    want(vol.file_read_at("/a", 0, 1, buf), ENoFs)
+    match vol.stat("/a")
+        EntOk(en) => test.fail("stat on an unmounted volume")
+        EntErr(e) => want(e, ENoFs)
+    want(vol.ent_read(nvfs.no_ent(), 0, 1, buf), ENoFs)
+    test.assert_eq(vol.ent_name_byte(nvfs.no_ent(), 0), -1)
+    want(vol.dir_open("/").err, ENoFs)
+    var o = vol.dir_open_pair(0, 1)
+    want(o.err, ENoFs)
+    var cur = o.cur
+    test.assert_false(vol.dir_next(cur).found, "an unmounted volume lists nothing")
+    test.assert_eq(vol.used_blocks(), -1)
+    let back = vol.unmount()
+    test.assert_eq(back.bc, 16)
+
+@test
+fn test_two_volumes_alternate()
+    ram_recycle()
+    nvfs.wear_reset()
+    let d1 = hostdev.ram_flash(16, 16, 512, 16)
+    let d2 = hostdev.ram_flash(16, 16, 512, 16)
+    want(nvfs.format(d1, nvfs.default_config()), EOk)
+    want(nvfs.format(d2, nvfs.default_config()), EOk)
+    let v1 = nvfs.mount(d1)
+    let v2 = nvfs.mount(d2)
+    want(hostfs.file_write(v1, "/one", pattern(600, 1)), EOk)
+    want(hostfs.file_write(v2, "/two", pattern(700, 2)), EOk)
+    test.assert_eq(read_all(v1, "/one"), pattern(600, 1))
+    test.assert_eq(read_all(v2, "/two"), pattern(700, 2))
+    want(read_err(v1, "/two"), ENotFound)
+    // unmounting a volume that does not hold the state leaves it
+    let _ = v1.unmount()
+    test.assert_eq(read_all(v2, "/two"), pattern(700, 2))
+    let _ = v2.unmount()
+
+@test
+fn test_listing_through_the_cursor_and_by_pair()
+    let vol = fresh(32)
+    want(vol.mkdir("/d"), EOk)
+    want(hostfs.file_write(vol, "/d/a", pattern(3, 0)), EOk)
+    match vol.stat("/d")
+        EntOk(en) =>
+            let o = vol.dir_open_pair(en.pair0 as Int, en.pair1 as Int)
+            want(o.err, EOk)
+            var cur = o.cur
+            let first = vol.dir_next(cur)
+            test.assert(first.found)
+            test.assert_eq(vol.ent_name_byte(first, 0), 97)
+            test.assert_false(vol.dir_next(cur).found, "one entry")
+        EntErr(e) => test.fail("stat /d: " + nvfs.err_str(e))
+    // a pair of two erased blocks is no directory
+    want(vol.dir_open_pair(30, 31).err, ECorrupt)
+    want(vol.dir_open("/d/a").err, ENotDir)

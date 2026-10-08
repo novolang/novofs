@@ -1,0 +1,76 @@
+// examples/image_write.nv: a file written on the board into
+// a volume the host made, for the host to list.
+//
+//   novo build --target=nrf52832-dk image_write.nv
+//
+// The build needs the same modules as image_read.nv.  The program
+// mounts the board's data region through RegionFlash without
+// format-on-empty, writes /from-board.txt with the text below, reads it
+// back, lists the root, and prints the volume's digest.  The suite then reads the
+// region through the probe and lists it with the host's image tool.
+
+use flash
+use nvfs
+use regionflash
+use devtools
+
+let PATH  = "/from-board.txt"
+let HELLO = "written by the board\n"
+
+// HELLO's first `n` bytes as a source for a file write.
+@value
+struct Hello
+    n: Int
+
+impl ByteSrc for Hello
+    fn src_len(self) -> Int
+        self.n
+
+    fn src_at(self, i: Int) -> Int
+        str.byte_at_or(HELLO, i, 0)
+
+fn line(name: Str, v: Int) [hw]
+    hal.uart.write(name)
+    hal.uart.write("=")
+    hal.uart.write(str.from_int(v))
+    hal.uart.write("\n")
+
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+fn main() [hw, mutate]
+    bsp.board.init()
+    let dev = regionflash.region_flash()
+    let vol = nvfs.mount(dev)
+    match vol.mounted()
+        MErr(e)   =>
+            say("mount=")
+            say(nvfs.err_str(e))
+            say("\n")
+        MOk(info) =>
+            say("mount=ok\n")
+            say("write hello=")
+            say(nvfs.err_str(vol.file_write(PATH, Hello { n: str.len(HELLO) })))
+            say("\n")
+            var buf: Buf = Vec.new()
+            let r = vol.file_read_at(PATH, 0, str.len(HELLO), buf)
+            var same = r == EOk and buf.len() == str.len(HELLO)
+            if same
+                for i in 0..buf.len()
+                    if (buf[i] as Int) != str.byte_at_or(HELLO, i, 0 - 1)
+                        same = false
+            line("read hello same", (if same then 1 else 0))
+            let o = vol.dir_open("/")
+            if o.err == EOk
+                var cur = o.cur
+                for step in 0..64
+                    let en = vol.dir_next(cur)
+                    if not en.found
+                        break
+                    say("root ")
+                    for i in 0..en.name_len as Int
+                        hal.uart.write_byte(vol.ent_name_byte(en, i))
+                    say("\n")
+            line("used blocks", vol.used_blocks())
+            line("digest", devtools.digest(vol, 0, 1, 0))
+    say("write done\n")

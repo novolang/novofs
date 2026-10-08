@@ -1,0 +1,151 @@
+// examples/emram.nv — a RAM-backed Flash device a device
+// build can use: the emulator's gate and the device power-loss loop.
+//
+// Its cells are a module-level `Vec[u8; EMRAM_CAP]` in static storage,
+// so it allocates nothing and needs no foreign function; it is
+// `impl Flash[mutate]`.  It keeps RamFlash's discipline (hostdev.nv):
+// reads and progs are alignment- and range-checked, a prog ANDs its
+// bytes into the cells as NOR flash does, and power can be cut after a
+// given number of progs and erases, cleanly or tearing the operation
+// in flight.  The geometry is set when the device is made, and
+// block_size × block_count is at most EMRAM_CAP.
+
+use flash
+
+let EMRAM_CAP = 8192
+
+var em_cells: Vec[u8; 8192] = Vec.new()
+
+// -1 = no cut scheduled; 0 = power is off
+var em_ops_left = -1
+var em_tear     = -1
+var em_op_count = 0
+
+@value
+struct EmRam
+    rs: u16
+    ps: u16
+    bs: u16
+    bc: u16
+
+// A device of `block_count` blocks of `block_size` bytes, every cell
+// erased, no cut scheduled.  The geometry is clamped to EMRAM_CAP.
+fn emram(read_size: Int, prog_size: Int, block_size: Int, block_count: Int) -> EmRam [mutate]
+    var bc = block_count
+    if block_size * bc > EMRAM_CAP
+        bc = EMRAM_CAP / block_size
+    em_cells.clear()
+    for i in 0..block_size * bc
+        let _ = em_cells.push(0xFF as u8)
+    em_ops_left = -1
+    em_tear = -1
+    em_op_count = 0
+    EmRam { rs: read_size as u16, ps: prog_size as u16, bs: block_size as u16, bc: bc as u16 }
+
+// Of the next progs and erases, `after_ops - 1` succeed and the one
+// after them is the cut: with `tear` < 0 it applies nothing, with
+// `tear` >= 0 a prog applies its first `tear` bytes and an erase erases
+// the first half of the block.  Every operation after the cut fails
+// until `em_restore`.
+fn em_schedule_cut(after_ops: Int, tear: Int) [mutate]
+    em_ops_left = after_ops
+    em_tear = tear
+
+// Restores power: no cut is scheduled and every operation runs.
+fn em_restore() [mutate]
+    em_ops_left = -1
+    em_tear = -1
+
+// Progs and erases that succeeded since the device was made.
+fn em_ops() -> Int [mutate]
+    em_op_count
+
+// 0 = proceed, 1 = this operation is the cut, 2 = power is off
+fn em_gate() -> Int [mutate]
+    if em_ops_left < 0
+        0
+    else if em_ops_left == 0
+        2
+    else
+        em_ops_left = em_ops_left - 1
+        if em_ops_left == 0
+            1
+        else
+            0
+
+impl Flash[mutate] for EmRam
+    fn read_size(self) -> Int
+        self.rs as Int
+
+    fn prog_size(self) -> Int
+        self.ps as Int
+
+    fn block_size(self) -> Int
+        self.bs as Int
+
+    fn block_count(self) -> Int
+        self.bc as Int
+
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate]
+        dst.clear()
+        let bs = self.bs as Int
+        let rs = self.rs as Int
+        if block < 0 or block >= (self.bc as Int) or off < 0 or len < 0 or len > BUF_CAP
+            return false
+        if off + len > bs or off % rs != 0 or len % rs != 0
+            return false
+        let base = block * bs + off
+        for i in 0..len
+            let _ = dst.push(em_cells[base + i])
+        true
+
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [mutate]
+        let bs = self.bs as Int
+        let ps = self.ps as Int
+        let len = src.len()
+        if block < 0 or block >= (self.bc as Int) or off < 0
+            return false
+        if off + len > bs or off % ps != 0 or len % ps != 0
+            return false
+        let gate = em_gate()
+        if gate == 2
+            return false
+        var n = len
+        if gate == 1
+            // torn prog: only the first em_tear bytes land
+            n = em_tear
+            if n > len
+                n = len
+            if n < 0
+                n = 0
+        let base = block * bs + off
+        for i in 0..n
+            em_cells[base + i] = (em_cells[base + i] as Int & src[i] as Int) as u8
+        if gate == 1
+            return false
+        em_op_count = em_op_count + 1
+        true
+
+    fn erase(self, block: Int) -> Bool [mutate]
+        let bs = self.bs as Int
+        if block < 0 or block >= (self.bc as Int)
+            return false
+        let gate = em_gate()
+        if gate == 2
+            return false
+        var n = bs
+        if gate == 1
+            if em_tear < 0
+                n = 0
+            else
+                // torn erase: only the first half of the block erases
+                n = bs / 2
+        for i in 0..n
+            em_cells[block * bs + i] = 0xFF as u8
+        if gate == 1
+            return false
+        em_op_count = em_op_count + 1
+        true
+
+    fn sync(self) -> Bool
+        true

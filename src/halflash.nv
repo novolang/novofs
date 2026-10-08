@@ -1,0 +1,127 @@
+// src/halflash.nv — a board's block storage as a Flash
+// device, over the compiler's `hal.block` surface.
+//
+// A board with storage offers `hal.block`: a fixed number of blocks
+// of a fixed size, one staging buffer the size of a block, and three
+// arms (read, write, erase) that each resolve a Future.  On the
+// nRF52840-DK the blocks are 512-byte slices of the top eight 4 KB
+// pages of the chip's flash, driven through its NVMC; under QEMU's
+// MPS2 AN386 they are 64 blocks of 512 bytes in `novo_block.img` in
+// QEMU's working directory, over semihosting.  Both complete
+// synchronously, so each Future is resolved when its arm returns.
+//
+// HalFlash reports a 16-byte page for reads and programs.  A prog is
+// a read-modify-write of the whole block: read it into the staging
+// buffer, AND the new bytes into it (a prog only clears bits, as on
+// NOR flash), write it back.  On the DK a write erases the block's
+// page and programs it, so each prog costs one page erase; the
+// filesystem batches a commit into one prog where it can.
+//
+// Effects: `impl Flash[hw, async, mutate]`.  `hw` is the storage,
+// `async` the await on each arm's Future, `mutate` the module-level
+// Future the arms share.  Nothing here allocates after the Future is
+// made, when the module initialises.
+
+use flash
+use core.rt
+
+// The page HalFlash reports as read_size and prog_size.
+let HAL_PAGE = 16
+
+// The Future every arm resolves.  One is made when the module
+// initialises and reused: no operation is outstanding when the next
+// one is armed, because the storage completes before the arm returns.
+var hal_done = core.rt.future_new()
+
+// A handle on the board's storage; it holds no state of its own.
+@value
+struct HalFlash
+    page: u8
+
+// The board's `hal.block` storage as a Flash device.  On the host,
+// which has no such storage, it reports no blocks and refuses every
+// access.
+pub @tier(embedded)
+fn hal_flash() -> HalFlash
+    HalFlash { page: HAL_PAGE as u8 }
+
+// Loads block `b` into the staging buffer; answers whether it did.
+@tier(embedded)
+// cov: skip — runs only on a board's hal.block storage; the host has no blocks
+fn load(b: Int) -> Bool [hw, async, mutate]
+    let rc = hal.block.read_arm(b, hal_done)
+    let v = core.rt.future_await(hal_done)
+    rc >= 0 and v >= 0
+
+impl Flash[hw, async, mutate] for HalFlash
+    @tier(embedded)
+    fn read_size(self) -> Int
+        HAL_PAGE
+
+    @tier(embedded)
+    fn prog_size(self) -> Int
+        HAL_PAGE
+
+    @tier(embedded)
+    fn block_size(self) -> Int [hw]
+        hal.block.size()
+
+    @tier(embedded)
+    fn block_count(self) -> Int [hw]
+        hal.block.count()
+
+    @tier(embedded)
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [hw, async, mutate]
+        dst.clear()
+        let bs = hal.block.size()
+        if block < 0 or block >= hal.block.count() or off < 0 or len < 0
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        if off + len > bs or len > BUF_CAP or off % HAL_PAGE != 0 or len % HAL_PAGE != 0
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        if not load(block)
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        for i in 0..len
+            let _ = dst.push((hal.block.buf_get(off + i) & 255) as u8)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        true
+
+    @tier(embedded)
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [hw, async, mutate]
+        let bs = hal.block.size()
+        let len = src.len()
+        if block < 0 or block >= hal.block.count() or off < 0
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        if off + len > bs or off % HAL_PAGE != 0 or len % HAL_PAGE != 0
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        if not load(block)
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        for i in 0..len
+            let old = hal.block.buf_get(off + i) & 255
+            hal.block.buf_set(off + i, old & src[i] as Int)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        let rc = hal.block.write_arm(block, hal_done)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        let v = core.rt.future_await(hal_done)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        rc >= 0 and v >= 0
+
+    @tier(embedded)
+    fn erase(self, block: Int) -> Bool [hw, async, mutate]
+        if block < 0 or block >= hal.block.count()
+            return false
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        let rc = hal.block.erase_arm(block, hal_done)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        let v = core.rt.future_await(hal_done)
+        // cov: skip — runs only on a board's hal.block storage; the host has no blocks
+        rc >= 0 and v >= 0
+
+    @tier(embedded)
+    fn sync(self) -> Bool
+        true

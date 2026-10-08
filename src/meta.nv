@@ -1,0 +1,526 @@
+// src/meta.nv — metadata-pair machinery (domain-free).
+//
+// A metadata pair is two erase blocks holding an append-only record
+// log; the block with the higher sealed revision is active.  This
+// module owns the byte-level mechanics: the read cache and the program
+// buffer every other module reads and writes flash through, scanning a
+// block's log, walking its records, and writing a record or a sealed
+// revision word.  What the records MEAN (superblock, directory
+// entries) is nvfs.nv's business.
+//
+// Block layout (see README.md "On-flash format history" for why the
+// records are padded away from the revision word):
+//
+//   [ revision u32 | pad-to-meta_off | records ... | 0xFF free ]
+//   meta_off = max(4, prog_size)
+//   record   = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ]
+//
+// Each record is padded with 0xFF to a prog_size multiple.  A
+// COMPACTION writes every record first and programs the revision word
+// LAST: a power cut mid-compaction leaves the sibling's revision word
+// erased (0xFFFFFFFF, invalid), and the old block keeps winning.  Once
+// the revision word programs, the sibling is complete by construction.
+// A partially programmed revision word reads as some value, but the
+// records behind it are already complete, so either arbitration
+// outcome is a consistent state.
+//
+// A torn APPEND (a bad CRC or a truncated header mid-log) ends the
+// block's valid log AND marks the block full: the garbage tail cannot
+// be programmed again reliably (NOR prog only clears bits), so the
+// next append goes through a compaction to the sibling.
+//
+// Memory: two buffers of flash.BUF_CAP bytes in static storage, the
+// read cache and the program buffer, and a handful of integers.  They
+// are module state because one filesystem operation runs at a time.
+// What they hold belongs to one mounted volume, the owner, which owns
+// its device: no write reaches that device except through the
+// filesystem, so the read cache and the kept scans stay true from one
+// operation of the volume to the next.  An operation of another volume
+// takes them over and drops them first (`claim`), and a mount or a
+// format drops them, so a second device is never answered from another
+// device's bytes.
+
+use flash
+use crc32
+
+let REV_ERASED = 0xFFFFFFFF
+
+// ── The read cache ──────────────────────────────────────────────────
+//
+// One window of one block.  A read outside it loads the read_size-
+// aligned window that starts at or below the offset.  A prog or an
+// erase of the cached block drops it.
+
+var rc: Buf = Vec.new()
+var rc_blk  = -1
+var rc_off  = 0
+
+// The last two scans, by block.  A scan reads its block's whole log and
+// checks every record's CRC, and one operation scans the same pair
+// several times: to walk to a directory, to find a name, to commit.  The
+// scans are kept by the read cache's rules: forgotten for a block before
+// the block is programmed or erased, so a scan is never answered from a
+// block that changed after it, and dropped with the read cache when
+// another volume claims the state.  A writer that knows what it
+// programmed, an append of one record or a compaction, files the scan
+// the block now has (`scan_note`), which is what a scan of it would
+// answer.
+var meta_sm_blk0 = -1
+var meta_sm_blk1 = -1
+var meta_sm_next = 0
+var meta_sm_res0 = MetaScan { valid: false, torn: false, rev: 0, end_off: 0, limit: 0 }
+var meta_sm_res1 = MetaScan { valid: false, torn: false, rev: 0, end_off: 0, limit: 0 }
+
+// The volume whose read cache and scans these are; -1 for none.
+var meta_owner = -1
+
+@tier(embedded)
+fn cache_drop() [mutate]
+    rc_blk = -1
+    meta_sm_blk0 = -1
+    meta_sm_blk1 = -1
+    meta_owner = -1
+
+// Makes volume `id` the owner of the read cache and the scans, keeping
+// them when it owns them already.  Answers whether it did not, in
+// which case they were dropped.
+@tier(embedded)
+fn claim(id: Int) -> Bool [mutate]
+    if meta_owner == id
+        return false
+    cache_drop()
+    meta_owner = id
+    true
+
+// Makes volume `id` the owner of what the read cache and the scans hold
+// now: a mount's, which read the device the volume takes.
+@tier(embedded)
+fn adopt(id: Int) [mutate]
+    meta_owner = id
+
+// Gives up volume `id`'s claim, dropping what it held.  Answers whether
+// it held one.
+@tier(embedded)
+fn release(id: Int) -> Bool [mutate]
+    if meta_owner != id
+        return false
+    cache_drop()
+    true
+
+// Files `r` as the scan of `blk`: the scan a writer knows the block has
+// after it programmed the block, which `scan_block` would answer.
+@tier(embedded)
+fn scan_note(blk: Int, r: MetaScan) [mutate]
+    if meta_sm_blk0 == blk
+        meta_sm_res0 = r
+    else if meta_sm_blk1 == blk
+        meta_sm_res1 = r
+    else
+        scan_keep(blk, r)
+
+// Keeps `r` as the scan of `blk` in a free place, or in place of the
+// older of the two.  A place a forgotten block left is free: a writer
+// forgets the block it programs and files its new scan afterwards, and
+// filing it over the other block's scan would make the next operation
+// on the pair read that block's whole log again.
+@tier(embedded)
+fn scan_keep(blk: Int, r: MetaScan) [mutate]
+    if meta_sm_blk0 < 0
+        meta_sm_blk0 = blk
+        meta_sm_res0 = r
+        meta_sm_next = 1
+    else if meta_sm_blk1 < 0
+        meta_sm_blk1 = blk
+        meta_sm_res1 = r
+        meta_sm_next = 0
+    else if meta_sm_next == 0
+        meta_sm_blk0 = blk
+        meta_sm_res0 = r
+        meta_sm_next = 1
+    else
+        meta_sm_blk1 = blk
+        meta_sm_res1 = r
+        meta_sm_next = 0
+
+@tier(embedded)
+fn cache_forget(blk: Int) [mutate]
+    if rc_blk == blk
+        rc_blk = -1
+    if meta_sm_blk0 == blk
+        meta_sm_blk0 = -1
+    if meta_sm_blk1 == blk
+        meta_sm_blk1 = -1
+
+// The byte at (blk, off), or -1 when it cannot be read.  A miss loads
+// the window of up to `cap` bytes, whole read units, that starts at or
+// below the offset.
+@tier(embedded)
+fn rd_win<D: Flash[e]>(dev: D, blk: Int, off: Int, cap: Int) -> Int [mutate, e]
+    if blk == rc_blk and off >= rc_off and off < rc_off + rc.len()
+        return rc[off - rc_off] as Int
+    let bs = dev.block_size()
+    let rs = dev.read_size()
+    if off < 0 or off >= bs or rs < 1 or rs > BUF_CAP
+        return -1
+    let start = off - off % rs
+    var win = cap - cap % rs
+    if win < rs
+        win = rs
+    if start + win > bs
+        win = bs - start
+    if not dev.read(blk, start, win, rc)
+        rc_blk = -1
+        return -1
+    rc_blk = blk
+    rc_off = start
+    rc[off - start] as Int
+
+// The byte at (blk, off) for a reader of a run of bytes: a miss loads a
+// whole cache's worth.
+@tier(embedded)
+fn rd8<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    rd_win(dev, blk, off, BUF_CAP)
+
+// A header walk reads a few bytes of each record, so a miss there
+// loads a short window, PEEK_BYTES rounded to whole read units, rather
+// than a whole cache's worth: a record of a few hundred bytes would
+// otherwise cost a full window load for its header alone.  The name
+// and the fields after a header are in the same short window.
+let PEEK_BYTES = 32
+
+@tier(embedded)
+fn rd16<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    let a = rd8(dev, blk, off)
+    let b = rd8(dev, blk, off + 1)
+    if a < 0 or b < 0
+        -1
+    else
+        a + b * 256
+
+// A little-endian u32, or -1 when it cannot be read.
+@tier(embedded)
+fn rd32<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    let a = rd8(dev, blk, off)
+    let b = rd8(dev, blk, off + 1)
+    let c = rd8(dev, blk, off + 2)
+    let d = rd8(dev, blk, off + 3)
+    if a < 0 or b < 0 or c < 0 or d < 0
+        -1
+    else
+        a + b * 256 + c * 65536 + d * 16777216
+
+// CRC-32C over blk[lo, hi), or -1 when a byte cannot be read.
+@tier(embedded)
+fn crc_range<D: Flash[e]>(dev: D, blk: Int, lo: Int, hi: Int) -> Int [mutate, e]
+    var c = 0xFFFFFFFF
+    var i = lo
+    // A read-cache window at a time: `rd8` loads the window holding
+    // byte `i`, and the bytes of it up to `hi` go through the CRC from
+    // the cache itself.
+    for step in 0..hi - lo + 1
+        if i >= hi
+            break
+        if rd8(dev, blk, i) < 0
+            return -1
+        var end = rc_off + rc.len()
+        if end > hi
+            end = hi
+        for k in i - rc_off..end - rc_off
+            c = crc32.update(c, rc[k] as Int)
+        i = end
+    c ^ 0xFFFFFFFF
+
+// ── The program buffer ──────────────────────────────────────────────
+//
+// Bytes written at (pb_blk, pb_off) onward collect here and are
+// programmed a chunk at a time: the largest prog_size multiple that
+// fits BUF_CAP.  A writer starts at a prog_size-aligned offset and pads
+// to one before it finishes, so every prog is aligned.  A failed prog
+// makes every later put a no-op and `wr_finish` answer false.
+
+var pb: Buf  = Vec.new()
+var pb_blk   = -1
+var pb_off   = 0
+var pb_chunk = 16
+var pb_ps    = 16
+var pb_fail  = false
+var wcrc     = 0
+// The offset just past the last record a writer closed: its checksum,
+// before the padding.
+var rec_last = 0
+
+@tier(embedded)
+fn wr_begin<D: Flash[e]>(dev: D, blk: Int, off: Int) [mutate, e]
+    let ps = dev.prog_size()
+    pb.clear()
+    pb_blk = blk
+    pb_off = off
+    pb_ps = ps
+    pb_chunk = BUF_CAP - BUF_CAP % ps
+    pb_fail = false
+
+@tier(embedded)
+fn wr_flush<D: Flash[e]>(dev: D) [mutate, e]
+    if pb.len() > 0
+        if not pb_fail
+            cache_forget(pb_blk)
+            if not dev.prog(pb_blk, pb_off, pb)
+                pb_fail = true
+        pb_off = pb_off + pb.len()
+        pb.clear()
+
+@tier(embedded)
+fn wr_put<D: Flash[e]>(dev: D, b: Int) [mutate, e]
+    if pb.len() >= pb_chunk
+        wr_flush(dev)
+    let _ = pb.push((b & 255) as u8)
+
+@tier(embedded)
+fn wr_put32<D: Flash[e]>(dev: D, v: Int) [mutate, e]
+    wr_put(dev, v & 255)
+    wr_put(dev, (v >>> 8) & 255)
+    wr_put(dev, (v >>> 16) & 255)
+    wr_put(dev, (v >>> 24) & 255)
+
+// The offset the next put lands at.
+@tier(embedded)
+fn wr_pos() -> Int [mutate]
+    pb_off + pb.len()
+
+// The offset just past the last record closed since `rec_reset`.
+@tier(embedded)
+fn rec_end() -> Int [mutate]
+    rec_last
+
+@tier(embedded)
+fn rec_reset(off: Int) [mutate]
+    rec_last = off
+
+// The scan of a block whose log ends at `limit` with nothing torn, as a
+// writer that just programmed it knows it.
+@tier(embedded)
+fn scan_of(rev: Int, limit: Int, ps: Int) -> MetaScan
+    MetaScan { valid: true, torn: false, rev: rev as u32, end_off: align_up(limit, ps) as u32,
+               limit: limit as u32 }
+
+// Pads with 0xFF (indistinguishable from free space on the next scan)
+// to the next prog_size boundary.
+@tier(embedded)
+fn wr_pad<D: Flash[e]>(dev: D) [mutate, e]
+    for i in 0..pb_ps
+        if wr_pos() % pb_ps == 0
+            break
+        wr_put(dev, 255)
+
+// Programs what is left; answers whether every prog succeeded.
+@tier(embedded)
+fn wr_finish<D: Flash[e]>(dev: D) -> Bool [mutate, e]
+    wr_flush(dev)
+    not pb_fail
+
+// ── Records ─────────────────────────────────────────────────────────
+
+@tier(embedded)
+fn align_up(n: Int, ps: Int) -> Int
+    let rem = n % ps
+    if rem == 0
+        n
+    else
+        n + (ps - rem)
+
+// The bytes a record with a `len`-byte payload takes on flash.
+@tier(embedded)
+fn rec_size(len: Int, ps: Int) -> Int
+    align_up(4 + len + 4, ps)
+
+@tier(embedded)
+fn meta_off<D: Flash[e]>(dev: D) -> Int [e]
+    let ps = dev.prog_size()
+    if ps > 4
+        ps
+    else
+        4
+
+// Opens a record: the header, into the CRC.
+@tier(embedded)
+fn rec_head<D: Flash[e]>(dev: D, rtype: Int, len: Int) [mutate, e]
+    wcrc = 0xFFFFFFFF
+    rec_byte(dev, rtype & 255)
+    rec_byte(dev, 0)
+    rec_byte(dev, len & 255)
+    rec_byte(dev, (len >>> 8) & 255)
+
+// One payload byte, into the CRC.
+@tier(embedded)
+fn rec_byte<D: Flash[e]>(dev: D, b: Int) [mutate, e]
+    wcrc = crc32.update(wcrc, b & 255)
+    wr_put(dev, b)
+
+@tier(embedded)
+fn rec_u32<D: Flash[e]>(dev: D, v: Int) [mutate, e]
+    rec_byte(dev, v & 255)
+    rec_byte(dev, (v >>> 8) & 255)
+    rec_byte(dev, (v >>> 16) & 255)
+    rec_byte(dev, (v >>> 24) & 255)
+
+// Closes a record: the CRC, then the padding.
+@tier(embedded)
+fn rec_tail<D: Flash[e]>(dev: D) [mutate, e]
+    wr_put32(dev, wcrc ^ 0xFFFFFFFF)
+    rec_last = wr_pos()
+    wr_pad(dev)
+
+// Programs the revision word of `blk` — the seal of a compaction — on
+// its own prog page, and syncs.
+@tier(embedded)
+fn seal<D: Flash[e]>(dev: D, blk: Int, rev: Int) -> Bool [mutate, e]
+    wr_begin(dev, blk, 0)
+    wr_put32(dev, rev)
+    wr_pad(dev)
+    if wr_finish(dev)
+        dev.sync()
+    else
+        false
+
+// ── Scanning ────────────────────────────────────────────────────────
+
+// One block's scan result.
+//   valid   — the revision word is sealed (the block takes part in
+//             arbitration)
+//   torn    — the log ends in garbage; the block is append-full
+//   end_off — the first free byte for an append (prog_size-aligned);
+//             block_size if torn
+//   limit   — the end of the last valid record: the records worth
+//             reading lie in [meta_off, limit)
+@value
+struct MetaScan
+    valid: Bool
+    torn: Bool
+    rev: u32
+    end_off: u32
+    limit: u32
+
+// The scan of `blk`, from the two kept when one of them is its.
+@tier(embedded)
+fn scan<D: Flash[e]>(dev: D, blk: Int) -> MetaScan [mutate, e]
+    if blk >= 0 and blk == meta_sm_blk0
+        return meta_sm_res0
+    if blk >= 0 and blk == meta_sm_blk1
+        return meta_sm_res1
+    let r = scan_block(dev, blk)
+    scan_keep(blk, r)
+    r
+
+@tier(embedded)
+fn scan_block<D: Flash[e]>(dev: D, blk: Int) -> MetaScan [mutate, e]
+    let bs = dev.block_size()
+    let ps = dev.prog_size()
+    let rev = rd32(dev, blk, 0)
+    if rev < 0
+        return MetaScan { valid: false, rev: 0, torn: true, end_off: bs as u32, limit: 0 }
+    if rev == REV_ERASED
+        return MetaScan { valid: false, rev: 0, torn: false, end_off: bs as u32, limit: 0 }
+    let m0 = meta_off(dev)
+    var off = m0
+    var torn = false
+    var last_end = m0
+    // Every pass advances `off` by at least one byte.
+    for step in 0..bs
+        if off + 4 > bs
+            break
+        let t = rd8(dev, blk, off)
+        if t < 0
+            torn = true
+            break
+        if t == 255
+            // Padding or free space.  Padding is shorter than a page,
+            // so a run of BUF_CAP erased bytes is the free space at the
+            // end of the log, and nothing past it was ever programmed:
+            // an append programs from the log's end, a prog moves at
+            // most BUF_CAP bytes, and a prog cut short leaves a prefix
+            // of its bytes, so a torn append begins inside that run.
+            let bound = if off + BUF_CAP < bs
+                off + BUF_CAP
+            else
+                bs
+            off = skip_erased(dev, blk, off, bound)
+            if off >= bound
+                break
+        else
+            let len = rd16(dev, blk, off + 2)
+            if len < 0 or off + 4 + len + 4 > bs
+                torn = true
+                break
+            let stored = rd32(dev, blk, off + 4 + len)
+            if stored < 0 or stored != crc_range(dev, blk, off, off + 4 + len)
+                torn = true
+                break
+            off = off + 4 + len + 4
+            last_end = off
+    if torn
+        MetaScan { valid: true,
+            rev: rev as u32,
+            torn: true,
+            end_off: bs as u32,
+            limit: last_end as u32 }
+    else
+        MetaScan { valid: true, rev: rev as u32, torn: false, end_off: align_up(last_end, ps) as u32,
+                   limit: last_end as u32 }
+
+// The first offset at or after `off`, below `bs`, whose byte does not
+// read 0xFF, or `bs` when every byte up to it does.  The bytes are
+// searched in the read cache's window, one window at a time, rather
+// than with a call per byte.  An offset whose byte cannot be read is
+// answered as it is, for the caller's own read to fail on.
+@tier(embedded)
+fn skip_erased<D: Flash[e]>(dev: D, blk: Int, off: Int, bs: Int) -> Int [mutate, e]
+    var o = off
+    for step in 0..bs
+        if o >= bs
+            break
+        if rd8(dev, blk, o) < 0
+            return o
+        for k in o - rc_off..rc.len()
+            if (rc[k] as Int) != 255
+                return rc_off + k
+        o = rc_off + rc.len()
+    bs
+
+// A record found by `rec_at`: its offset, type, payload length, and
+// the offset just past it.  Its payload starts at off + 4.
+@value
+struct RecAt
+    ok: Bool
+    rtype: u8
+    len: u16
+    off: u32
+    next: u32
+
+// The first record at or after `off` and before `limit`.  Records
+// below a scan's limit were CRC-checked by the scan, so this reads only
+// their headers, in short windows.
+@tier(embedded)
+fn rec_at<D: Flash[e]>(dev: D, blk: Int, off: Int, limit: Int) -> RecAt [mutate, e]
+    var o = off
+    for step in 0..limit - off + 1
+        if o >= limit
+            break
+        let t = rd_win(dev, blk, o, PEEK_BYTES)
+        if t < 0
+            break
+        if t != 255
+            let lo = rd_win(dev, blk, o + 2, PEEK_BYTES)
+            let hi = rd_win(dev, blk, o + 3, PEEK_BYTES)
+            let len = if lo < 0 or hi < 0
+                -1
+            else
+                lo + hi * 256
+            if len < 0
+                break
+            return RecAt { ok: true,
+                off: o as u32,
+                rtype: t as u8,
+                len: len as u16,
+                next: (o + 4 + len + 4) as u32 }
+        o = o + 1
+    RecAt { ok: false, off: limit as u32, rtype: 0, len: 0, next: limit as u32 }

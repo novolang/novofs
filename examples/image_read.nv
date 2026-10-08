@@ -1,0 +1,146 @@
+// examples/image_read.nv: a novofs image made on the host,
+// mounted from the board's data region and read, never written.
+//
+//   novofs mk tree -o image.bin --target=nrf52832-dk
+//   novo flash --target=nrf52832-dk --data image.bin
+//   novo build --target=nrf52832-dk image_read.nv
+//
+// The build needs the novofs modules flash, crc32, meta, nvfs and
+// regionflash from src/ beside this file, with devtools.nv from this
+// directory; tests/board_image.sh assembles them.
+//
+// The program prints the region's geometry as the board's flash driver
+// answers it, mounts the region through RegionFlash without
+// format-on-empty, lists every entry with its kind and size, prints
+// each file's CRC-32C and, for a file of up to 64 bytes, its text, and
+// prints the volume's digest.  It writes nothing, so the region read back
+// through the probe afterwards is the image byte for byte.  Each line it
+// prints is `name=value` or starts with `entry `, for the suite to read.
+
+use flash
+use crc32
+use nvfs
+use regionflash
+use devtools
+
+let TEXT_MAX = 64
+
+fn line(name: Str, v: Int) [hw]
+    hal.uart.write(name)
+    hal.uart.write("=")
+    hal.uart.write(str.from_int(v))
+    hal.uart.write("\n")
+
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+// The path of the entry being listed, as bytes.
+fn put_path(var pbuf: Buf) [hw]
+    for b in pbuf
+        hal.uart.write_byte(b as Int)
+
+// Prints the file's CRC-32C, and its text when it is short: a newline
+// is printed as `\n`.
+fn show_file(vol: Volume<RegionFlash>, en: Ent, var pbuf: Buf) [hw, mutate]
+    let size = nvfs.ent_size(en)
+    var buf: Buf = Vec.new()
+    var crc = 0xFFFFFFFF
+    var pos = 0
+    var ok = true
+    for chunk in 0..size / BUF_CAP + 1
+        if pos >= size
+            break
+        var n = size - pos
+        if n > BUF_CAP
+            n = BUF_CAP
+        if vol.ent_read(en, pos, n, buf) != EOk
+            ok = false
+            break
+        for b in buf
+            crc = crc32.update(crc, b as Int)
+        pos = pos + n
+    say("entry f ")
+    put_path(pbuf)
+    say(" ")
+    hal.uart.write(str.from_int(size))
+    if ok
+        say(" crc=")
+        hal.uart.write(str.from_int(crc ^ 0xFFFFFFFF))
+    else
+        say(" unreadable")
+    say("\n")
+    if ok and size <= TEXT_MAX and vol.ent_read(en, 0, size, buf) == EOk
+        say("text ")
+        put_path(pbuf)
+        say(" ")
+        for b in buf
+            if (b as Int) == 10
+                say("\\n")
+            else
+                hal.uart.write_byte(b as Int)
+        say("\n")
+
+// Lists the directory whose pair is (b0, b1), and every directory under
+// it, `pbuf` holding the directory's path; answers the entries seen, or
+// -1 when one cannot be read.
+fn walk(vol: Volume<RegionFlash>, b0: Int, b1: Int, var pbuf: Buf, depth: Int) -> Int [hw, mutate]
+    if depth > 8
+        return -1
+    let o = vol.dir_open_pair(b0, b1)
+    if o.err != EOk
+        return -1
+    var cur = o.cur
+    var seen = 0
+    let base = pbuf.len()
+    for step in 0..64
+        let en = vol.dir_next(cur)
+        if not en.found
+            break
+        for k in 0..BUF_CAP
+            if pbuf.len() <= base
+                break
+            let _ = pbuf.pop()
+        let _ = pbuf.push(47)
+        for i in 0..en.name_len as Int
+            let _ = pbuf.push(vol.ent_name_byte(en, i) as u8)
+        seen = seen + 1
+        if (en.kind as Int) == KIND_DIR
+            say("entry d ")
+            put_path(pbuf)
+            say("\n")
+            let sub = walk(vol, en.pair0 as Int, en.pair1 as Int, pbuf, depth + 1)
+            if sub < 0
+                return -1
+            seen = seen + sub
+        else
+            show_file(vol, en, pbuf)
+    for k in 0..BUF_CAP
+        if pbuf.len() <= base
+            break
+        let _ = pbuf.pop()
+    seen
+
+fn main() [hw, mutate]
+    bsp.board.init()
+    let dev = regionflash.region_flash()
+    line("region start", hal.block.region_start())
+    line("region bytes", hal.block.region_bytes())
+    line("erase size", hal.block.erase_size())
+    line("write size", hal.block.write_size())
+    line("page", dev.prog_size())
+    line("blocks", dev.block_count())
+    let vol = nvfs.mount(dev)
+    match vol.mounted()
+        MErr(e)   =>
+            say("mount=")
+            say(nvfs.err_str(e))
+            say("\n")
+        MOk(info) =>
+            say("mount=ok\n")
+            line("block size", info.block_size)
+            line("block count", info.block_count)
+            var pbuf: Buf = Vec.new()
+            line("entries", walk(vol, 0, 1, pbuf, 0))
+            line("used blocks", vol.used_blocks())
+            line("digest", devtools.digest(vol, 0, 1, 0))
+    say("read done\n")
