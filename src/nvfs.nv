@@ -457,16 +457,19 @@ fn resolve<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
     var cur: NameBuf = Vec.new()
     var lim = limit
     var hops = 0
-    var first = Hit { kind: HIT_NONE, rec: RecAt { ok: false, rtype: 0, len: 0, off: 0, next: 0 } }
+    // The record offset of the chain's first rename, read again when
+    // the answer takes its new name; an offset, not the record, so the
+    // frame of this function stays small on a 32-bit core.
+    var first_off = -1
     copy_key(cur, key)
     for step in 0..limit + 1
         let h = last_hit(dev, blk, lim, cur)
         if h.kind == HIT_DIRENT
-            return renamed(dev, blk, dec_dirent(dev, blk, h.rec), first, hops)
+            return renamed(dev, blk, limit, dec_dirent(dev, blk, h.rec), first_off)
         if h.kind != HIT_REN_TO
             break
         if hops == 0
-            first = h
+            first_off = h.rec.off as Int
         let rn = ren_names(dev, blk, h.rec)
         key_of_flash(cur, dev, blk, rn.old_off, rn.old_len)
         lim = h.rec.off as Int
@@ -477,26 +480,37 @@ fn resolve<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
     // the same, and so on outward.
     for back in 0..hops
         let j = hops - 1 - back
-        copy_key(cur, key)
-        lim = limit
-        for t in 0..j
-            let ht = last_hit(dev, blk, lim, cur)
-            let rt = ren_names(dev, blk, ht.rec)
-            key_of_flash(cur, dev, blk, rt.old_off, rt.old_len)
-            lim = ht.rec.off as Int
-        let hj = last_hit(dev, blk, lim, cur)
-        let en = resolve(dev, blk, hj.rec.off as Int, cur, depth + 1)
+        let en = resolve_hop(dev, blk, limit, key, cur, j, depth)
         if en.found
-            return renamed(dev, blk, en, first, j)
+            return renamed(dev, blk, limit, en, if j == 0 then -1 else first_off)
     no_ent()
 
-// `en` under the new name of the rename `first`, when the answer came
-// through one or more renames (`hops` above 0).
+// The entry below the j-th rename of the chain from `key`: the chain's
+// hops walked again from the start, then the search continued below
+// that hop's record.  Its own function, so the walk's records are in
+// this frame and not in resolve's, which holds the outer walk's.
 @tier(embedded)
-fn renamed<D: Flash[e]>(dev: D, blk: Int, en: Ent, first: Hit, hops: Int) -> Ent [mutate, e]
-    if hops == 0
+fn resolve_hop<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
+                            var cur: NameBuf, j: Int, depth: Int) -> Ent [mutate, e]
+    copy_key(cur, key)
+    var lim = limit
+    for t in 0..j
+        let ht = last_hit(dev, blk, lim, cur)
+        let rt = ren_names(dev, blk, ht.rec)
+        key_of_flash(cur, dev, blk, rt.old_off, rt.old_len)
+        lim = ht.rec.off as Int
+    let hj = last_hit(dev, blk, lim, cur)
+    resolve(dev, blk, hj.rec.off as Int, cur, depth + 1)
+
+// `en` under the new name of the rename at `first_off`, when the answer
+// came through one or more renames; `en` itself when `first_off` is
+// below 0.
+@tier(embedded)
+fn renamed<D: Flash[e]>(dev: D, blk: Int, limit: Int, en: Ent, first_off: Int) -> Ent [mutate, e]
+    if first_off < 0
         return en
-    let rn = ren_names(dev, blk, first.rec)
+    let r = meta.rec_at(dev, blk, first_off, limit)
+    let rn = ren_names(dev, blk, r)
     Ent { found: true, kind: en.kind, pair0: en.pair0, pair1: en.pair1,
           size: en.size, blk: en.blk, name_off: rn.new_off as u32,
           name_len: rn.new_len as u8, data_off: en.data_off }

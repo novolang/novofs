@@ -366,7 +366,7 @@ as it reads its source.  Every operation on a mounted volume passes
 |---|---|
 | `.text` of the core, MPS2 AN386 build | 39,168 bytes |
 | Static RAM beyond the read cache and the program buffer | 984 bytes |
-| Deepest chain of stack frames below a volume's `file_write`, STM32F407 image | 3,624 bytes |
+| Deepest chain of stack frames below a volume's `file_write`, STM32F407 image | 3,656 bytes |
 
 | Device | Module | Implements |
 |---|---|---|

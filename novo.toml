@@ -1,6 +1,6 @@
 [package]
 name        = "novofs"
-version     = "0.2.0"
+version     = "0.2.1"
 description = "A power-loss-resilient filesystem for NOR flash, written in novo-lang and modelled on littlefs: a Flash trait with RAM, image-file, block-device and board-region devices, copy-on-write metadata pairs, CRC-checked commits, CTZ skip-list files, a mounted volume that owns its device, and an image tool (mk, ls, cat, extract, fsck, df)."
 license     = "Apache-2.0"
 category    = "embedded"

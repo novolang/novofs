@@ -4,8 +4,11 @@
     stack_chain.py <image.elf> <function-regex>...
 
 Reads the image's code with arm-none-eabi-objdump: each function's frame
-is the registers its `push` and `vpush` save plus its `sub sp` adjustment,
-and its callees are the targets of its `bl` and `blx` instructions.  For
+is the registers its `push` and `vpush` save, plus its prologue's `sub sp`
+adjustment, plus the largest of the `sub sp` adjustments it makes around a
+call (the stack-passed arguments of one call; the areas of two calls are
+never live at once, so the largest counts and not their sum), and its
+callees are the targets of its `bl` and `blx` instructions.  For
 each function whose name matches one of the patterns, prints the bytes of
 its deepest chain and the chain, one function and its frame a line.
 
@@ -25,6 +28,9 @@ def frames(elf):
     dis = subprocess.run(["arm-none-eabi-objdump", "-d", "--no-show-raw-insn", elf],
                          capture_output=True, text=True, check=True).stdout
     frame, calls, cur = {}, {}, None
+    # The prologue's adjustment is the first `sub sp` of a function; every
+    # later one is a call's argument area, of which the largest counts.
+    call_area, saw_prologue = {}, {}
 
     def count(regs):
         n = 0
@@ -43,6 +49,8 @@ def frames(elf):
             cur = m.group(1)
             frame[cur] = 0
             calls[cur] = set()
+            call_area[cur] = 0
+            saw_prologue[cur] = False
             continue
         if cur is None:
             continue
@@ -54,10 +62,17 @@ def frames(elf):
             frame[cur] += 8 * count(m.group(1))
         m = re.search(r"\bsub(w|\.w)?\s+sp,\s*(sp,\s*)?#(\d+)", line)
         if m:
-            frame[cur] += int(m.group(3))
+            n = int(m.group(3))
+            if not saw_prologue[cur]:
+                frame[cur] += n
+                saw_prologue[cur] = True
+            elif n > call_area[cur]:
+                call_area[cur] = n
         m = re.search(r"\bblx?\s+[0-9a-f]+ <([^>+]+)>", line)
         if m:
             calls[cur].add(m.group(1))
+    for f in frame:
+        frame[f] += call_area[f]
     return frame, calls
 
 

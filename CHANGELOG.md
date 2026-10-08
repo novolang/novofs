@@ -5,6 +5,20 @@ All notable changes to novofs are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.1 — 2026-10-08
+
+- The rename resolver's backward search is a function of its own, so
+  the resolver's frame holds the outer walk's records and not both
+  walks': the deepest chain below `file_write` on the STM32F407 image
+  is 3,656 bytes, where 0.2.0's was 3,696.  No change in what any
+  operation answers.
+- The stack-chain tool counts a function's largest call-site stack
+  adjustment, not the sum of them: two calls' argument areas are never
+  live at once.  0.2.0's tool read the resolver as 1,352 bytes of frame
+  and the chain as 4,408, over a 4 KB task stack, for a frame that is
+  728 bytes.
+- The README's figure for the write chain follows the tool.
+
 ## 0.2.0 — 2026-10-08
 
 A mounted volume.  It needs novo 0.20.0 or later, the first release in
