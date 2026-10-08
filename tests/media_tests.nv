@@ -3,14 +3,282 @@
 // metadata pair, superblocks and records written by hand, and devices
 // whose reads, progs, erases or syncs fail.
 
-use std.test
 use std.bytes
+use std.list
+use std.test
 
-use flash
-use hostdev
-use meta
 use nvfs
-use hostfs
+
+// ── The suite's RAM device ──────────────────────────────────────────
+//
+// RamFlash keeps its cells in one module-level list, each device its
+// own run of `bs * bc` cells from `h`.  It enforces NOR rules: offsets
+// and lengths are whole units, a prog ANDs its bytes into the cells, and
+// an erase sets a block to 0xFF.  It carries the wear counters, the
+// bad-block set and the power-cut schedule of the most recent device.
+// A suite file is a program of its own, so each suite that needs a
+// device carries this block.
+
+var ram_cells: [Int]  = []
+var ram_counts: [Int] = []
+var ram_bad: [Int]    = []
+var ram_nblocks       = 0
+var ram_last_h        = 0 - 1
+var ram_ops_left      = 0 - 1   // -1: no cut scheduled; 0: power is off
+var ram_tear          = 0 - 1
+var ram_op_count      = 0
+
+struct RamFlash
+    h: Int
+    rs: Int
+    ps: Int
+    bs: Int
+    bc: Int
+
+// Releases the most recent device's cells; a device made after it
+// reuses them.
+fn ram_recycle() [mutate]
+    if ram_last_h >= 0
+        ram_cells = list.take(ram_cells, ram_last_h)
+        ram_last_h = 0 - 1
+
+// A RamFlash of `bc` blocks of `bs` bytes, read in units of `rs` and
+// programmed in pages of `ps`, every byte erased to 0xFF.  It resets the
+// wear counters, the bad blocks and the power-cut schedule.
+fn ram_flash(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash [mutate]
+    ram_counts = list.map(list.range(0, bc), i => 0)
+    ram_bad = list.map(list.range(0, bc), i => 0)
+    ram_nblocks = bc
+    ram_ops_left = 0 - 1
+    ram_tear = 0 - 1
+    ram_op_count = 0
+    // The new device's cells follow the others, erased.  The list is
+    // made again rather than extended: list.concat onto this
+    // module-level list leaks one list (novo-lang bug
+    // module-var-list-concat-leaks).
+    let h = list.len(ram_cells)
+    let before = ram_cells
+    ram_cells = list.map(list.range(0, h + bs * bc), i => (if i < h then before[i] else 255))
+    ram_last_h = h
+    RamFlash { h: h, rs: rs, ps: ps, bs: bs, bc: bc }
+
+// Of the next progs and erases, `after_ops - 1` succeed and the next is
+// cut: with `tear` below 0 it applies nothing, otherwise a prog applies
+// its first `tear` bytes and an erase erases the first half of its
+// block.  Every operation after the cut fails until `ram_clear_cut`.
+fn ram_schedule_cut(after_ops: Int, tear: Int) [mutate]
+    ram_ops_left = after_ops
+    ram_tear = tear
+
+fn ram_clear_cut() [mutate]
+    ram_ops_left = 0 - 1
+    ram_tear = 0 - 1
+
+fn ram_op_count_get() -> Int [mutate]
+    ram_op_count
+
+fn ram_op_count_reset() [mutate]
+    ram_op_count = 0
+
+// 0: proceed; 1: this operation is the cut; 2: power is off.
+fn ram_cut_gate() -> Int [mutate]
+    if ram_ops_left < 0
+        0
+    else if ram_ops_left == 0
+        2
+    else
+        ram_ops_left = ram_ops_left - 1
+        if ram_ops_left == 0
+            1
+        else
+            0
+
+fn ram_mark_bad(b: Int) [mutate]
+    if b >= 0 and b < ram_nblocks
+        ram_bad[b] = 1
+
+fn ram_is_bad(b: Int) -> Bool [mutate]
+    b >= 0 and b < ram_nblocks and ram_bad[b] == 1
+
+fn ram_erase_count(b: Int) -> Int [mutate]
+    if b >= 0 and b < ram_nblocks
+        ram_counts[b]
+    else
+        0
+
+impl Flash[mutate] for RamFlash
+    fn read_size(self) -> Int
+        self.rs
+
+    fn prog_size(self) -> Int
+        self.ps
+
+    fn block_size(self) -> Int
+        self.bs
+
+    fn block_count(self) -> Int
+        self.bc
+
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate]
+        dst.clear()
+        if block < 0 or block >= self.bc or off < 0 or len < 0 or len > BUF_CAP
+            false
+        else if off + len > self.bs or off % self.rs != 0 or len % self.rs != 0
+            false
+        else
+            let base = self.h + block * self.bs + off
+            for i in 0..len
+                let _ = dst.push(ram_cells[base + i] as u8)
+            true
+
+    fn prog(self, block: Int, off: Int, var data: Buf) -> Bool [mutate]
+        let len = data.len()
+        if block < 0 or block >= self.bc or off < 0
+            false
+        else if off + len > self.bs or off % self.ps != 0 or len % self.ps != 0
+            false
+        else if ram_is_bad(block)
+            false
+        else
+            let base = self.h + block * self.bs + off
+            let gate = ram_cut_gate()
+            if gate == 2
+                false
+            else if gate == 1
+                var t = ram_tear
+                if t > len
+                    t = len
+                for it in 0..t
+                    ram_cells[base + it] = ram_cells[base + it] & data[it] as Int
+                false
+            else
+                for i in 0..len
+                    ram_cells[base + i] = ram_cells[base + i] & data[i] as Int
+                ram_op_count = ram_op_count + 1
+                true
+
+    fn erase(self, block: Int) -> Bool [mutate]
+        if block < 0 or block >= self.bc
+            false
+        else if ram_is_bad(block)
+            false
+        else
+            let base = self.h + block * self.bs
+            let gate = ram_cut_gate()
+            if gate == 2
+                false
+            else if gate == 1
+                for ih in 0..self.bs / 2
+                    ram_cells[base + ih] = 255
+                false
+            else
+                for i in 0..self.bs
+                    ram_cells[base + i] = 255
+                ram_counts[block] = ram_counts[block] + 1
+                ram_op_count = ram_op_count + 1
+                true
+
+    fn sync(self) -> Bool
+        true
+
+// Programs `data` at (block, off) through any device.
+fn prog_bytes<D: Flash[e]>(dev: D, block: Int, off: Int, data: Bytes) -> Bool [e]
+    var buf: Buf = Vec.new()
+    for i in 0..bytes.len(data)
+        let _ = buf.push((bytes.byte_at(data, i) ?? 0) as u8)
+    dev.prog(block, off, buf)
+
+// The `len` bytes at (block, off) of any device, or None.
+fn read_bytes<D: Flash[e]>(dev: D, block: Int, off: Int, len: Int) -> ?Bytes [e]
+    var buf: Buf = Vec.new()
+    if not dev.read(block, off, len, buf)
+        return None
+    var out = bytes.zeros(buf.len())
+    for i in 0..buf.len()
+        out = bytes.set_u8(out, i, buf[i] as Int)
+    Some(out)
+
+// ── Whole files and listings, over the volume's operations ─────────
+
+// A Bytes as a source, so a test writes one in a call.  It wraps the
+// Bytes because an impl for Bytes itself, written here, is not reached
+// from the package's generic code (novo-lang bug
+// impl-for-bytes-in-another-module-not-dispatched).
+struct BytesSrc
+    b: Bytes
+
+impl ByteSrc for BytesSrc
+    fn src_len(self) -> Int
+        bytes.len(self.b)
+
+    fn src_at(self, i: Int) -> Int
+        bytes.byte_at(self.b, i) ?? 0
+
+enum FileRes
+    FOk(data: Bytes)
+    FErr(e: FsError)
+
+struct DirEntry
+    name: Str
+    is_dir: Bool
+    size: Int
+
+enum DirListRes
+    DLOk(entries: [DirEntry])
+    DLErr(e: FsError)
+
+fn file_write<D: Flash[e]>(vol: Volume<D>, path: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_write(path, BytesSrc { b: data })
+
+fn file_append<D: Flash[e]>(vol: Volume<D>, path: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_append(path, BytesSrc { b: data })
+
+// `len` bytes of `path` from `off`, a Buf at a time.  A range past the
+// end of the file answers EInvalidConfig, and a directory EIsDir.
+fn file_read_at<D: Flash[e]>(vol: Volume<D>, path: Str, off: Int, len: Int) -> FileRes [mutate, e]
+    match vol.stat(path)
+        EntErr(err) => FErr(err)
+        EntOk(en)   =>
+            if en.is_dir
+                return FErr(EIsDir)
+            if off < 0 or len < 0 or off + len > en.size
+                return FErr(EInvalidConfig)
+            var out = bytes.zeros(len)
+            var buf: Buf = Vec.new()
+            for chunk in 0..(len + BUF_CAP - 1) / BUF_CAP
+                let at = chunk * BUF_CAP
+                var n = len - at
+                if n > BUF_CAP
+                    n = BUF_CAP
+                let r = vol.file_read_at(path, off + at, n, buf)
+                if r != EOk
+                    return FErr(r)
+                for k in 0..n
+                    out = bytes.set_u8(out, at + k, buf[k] as Int)
+            FOk(out)
+
+// The whole of `path`, or why it cannot be read.
+fn file_read<D: Flash[e]>(vol: Volume<D>, path: Str) -> FileRes [mutate, e]
+    match vol.stat(path)
+        EntErr(err) => FErr(err)
+        EntOk(en)   => file_read_at(vol, path, 0, en.size)
+
+// The entries of `path`, in the order the directory holds them.
+fn dir_list<D: Flash[e]>(vol: Volume<D>, path: Str) -> DirListRes [mutate, e]
+    var at = vol.list(path)
+    if at.err != EOk
+        return DLErr(at.err)
+    var es: [DirEntry] = []
+    while true
+        match vol.list_next(at)
+            Some(en) =>
+                es = list.push(es, DirEntry { name: en.name_str(), is_dir: en.is_dir, size: en.size })
+            None     =>
+                break
+    DLOk(es)
+
+fn entry_size(e: DirEntry) -> Int
+    e.size
 
 // ── A device that fails on request ──────────────────────────────────
 //
@@ -31,7 +299,7 @@ fn faults_off() [mutate]
 struct FaultFlash
     ram: RamFlash
 
-impl Flash[mutate, ffi] for FaultFlash
+impl Flash[mutate] for FaultFlash
     fn read_size(self) -> Int
         self.ram.rs
 
@@ -44,7 +312,7 @@ impl Flash[mutate, ffi] for FaultFlash
     fn block_count(self) -> Int
         self.ram.bc
 
-    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate, ffi]
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate]
         if block == fail_read_block
             dst.clear()
             return false
@@ -57,11 +325,11 @@ impl Flash[mutate, ffi] for FaultFlash
         let r = self.ram
         r.read(block, off, len, dst)
 
-    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [mutate, ffi]
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [mutate]
         let r = self.ram
         r.prog(block, off, src)
 
-    fn erase(self, block: Int) -> Bool [mutate, ffi]
+    fn erase(self, block: Int) -> Bool [mutate]
         let r = self.ram
         r.erase(block)
 
@@ -86,24 +354,24 @@ fn cfg_with(cycles: Int) -> FsConfig
     FsConfig { block_cycles: cycles, cache_size: c.cache_size, lookahead_size: c.lookahead_size,
                name_max: c.name_max, file_max: c.file_max, inline_max: c.inline_max }
 
-fn ram(bc: Int) -> RamFlash [mutate, ffi]
+fn ram(bc: Int) -> RamFlash [mutate]
     ram_recycle()
     faults_off()
     nvfs.wear_reset()
-    hostdev.ram_flash(16, 16, 512, bc)
+    ram_flash(16, 16, 512, bc)
 
-fn fresh(bc: Int) -> Volume<RamFlash> [mutate, ffi]
+fn fresh(bc: Int) -> Volume<RamFlash> [mutate]
     let dev = ram(bc)
     let _ = nvfs.format(dev, nvfs.default_config())
     nvfs.mount(dev)
 
 fn read_all<D: Flash[e]>(vol: Volume<D>, p: Str) -> Bytes [mutate, e]
-    match hostfs.file_read(vol, p)
+    match file_read(vol, p)
         FOk(b)  => b
         FErr(e) => bytes.from_byte_list([255, 255, 255])
 
 fn names<D: Flash[e]>(vol: Volume<D>, p: Str) -> Str [mutate, e]
-    match hostfs.dir_list(vol, p)
+    match dir_list(vol, p)
         DLErr(e) => "err " + nvfs.err_str(e)
         DLOk(es) =>
             var s = ""
@@ -114,13 +382,13 @@ fn names<D: Flash[e]>(vol: Volume<D>, p: Str) -> Str [mutate, e]
 // Writes one record of type `rtype` with `payload` at (blk, off) and
 // answers the offset after it.
 fn put_rec<D: Flash[e]>(dev: D, blk: Int, off: Int, rtype: Int, payload: [Int]) -> Int [mutate, e]
-    meta.wr_begin(dev, blk, off)
-    meta.rec_head(dev, rtype, list.len(payload))
+    nvfs.wr_begin(dev, blk, off)
+    nvfs.rec_head(dev, rtype, list.len(payload))
     for b in payload
-        meta.rec_byte(dev, b)
-    meta.rec_tail(dev)
-    let _ = meta.wr_finish(dev)
-    meta.wr_pos()
+        nvfs.rec_byte(dev, b)
+    nvfs.rec_tail(dev)
+    let _ = nvfs.wr_finish(dev)
+    nvfs.wr_pos()
 
 fn u32le(v: Int) -> [Int]
     [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255]
@@ -135,10 +403,10 @@ fn sb_payload(ver: Int, bc: Int) -> [Int]
 
 // Block `blk` erased, sealed with revision `rev`, holding one record.
 fn hand_block<D: Flash[e]>(dev: D, blk: Int, rev: Int, rtype: Int, payload: [Int]) [mutate, e]
-    meta.cache_drop()
+    nvfs.cache_drop()
     let _ = dev.erase(blk)
     let _ = put_rec(dev, blk, 16, rtype, payload)
-    let _ = meta.seal(dev, blk, rev)
+    let _ = nvfs.seal(dev, blk, rev)
 
 fn dirent_dir(name: Str, p0: Int, p1: Int) -> [Int]
     let nm = list.map(list.range(0, str.len(name)), i => str.byte_at_or(name, i, 0))
@@ -150,11 +418,11 @@ fn dirent_dir(name: Str, p0: Int, p1: Int) -> [Int]
 fn test_rewrites_compact_the_root_into_its_sibling()
     let vol = fresh(32)
     want(vol.mkdir("/d"), EOk)
-    want(hostfs.file_write(vol, "/big", pattern(700, 3)), EOk)
+    want(file_write(vol, "/big", pattern(700, 3)), EOk)
     // every rewrite of /f appends a 112-byte record; the fifth does
     // not fit and folds the live state into block 1
     for i in 0..12
-        want(hostfs.file_write(vol, "/f", pattern(100, i)), EOk)
+        want(file_write(vol, "/f", pattern(100, i)), EOk)
     test.assert_eq(names(vol, "/"), "d;big;f;")
     test.assert_eq(read_all(vol, "/f"), pattern(100, 11))
     test.assert_eq(read_all(vol, "/big"), pattern(700, 3))
@@ -168,11 +436,11 @@ fn test_rewrites_compact_the_root_into_its_sibling()
 @test
 fn test_a_directory_whose_live_state_fills_a_block_refuses_more()
     let vol = fresh(32)
-    want(hostfs.file_write(vol, "/a", pattern(100, 1)), EOk)
-    want(hostfs.file_write(vol, "/b", pattern(100, 2)), EOk)
-    want(hostfs.file_write(vol, "/c", pattern(100, 3)), EOk)
-    want(hostfs.file_write(vol, "/e", pattern(100, 4)), EOk)
-    want(hostfs.file_write(vol, "/g", pattern(100, 5)), ENoSpace)
+    want(file_write(vol, "/a", pattern(100, 1)), EOk)
+    want(file_write(vol, "/b", pattern(100, 2)), EOk)
+    want(file_write(vol, "/c", pattern(100, 3)), EOk)
+    want(file_write(vol, "/e", pattern(100, 4)), EOk)
+    want(file_write(vol, "/g", pattern(100, 5)), ENoSpace)
     test.assert_eq(names(vol, "/"), "a;b;c;e;")
 
 @test
@@ -183,15 +451,16 @@ fn test_a_worn_directory_pair_moves_to_fresh_blocks()
     want(vol.mkdir("/d"), EOk)
     want(vol.mkdir("/d/e"), EOk)
     var first = 0
-    match vol.stat("/d/e")
-        EntOk(en) =>
+    // The pair's first block, read through the internal lookup.
+    match nvfs.op_stat(dev, "/d/e")
+        AtOk(en) =>
             first = en.pair0 as Int
-        EntErr(e) => test.fail("stat: " + nvfs.err_str(e))
+        AtErr(e) => test.fail("stat: " + nvfs.err_str(e))
     for i in 0..30
-        want(hostfs.file_write(vol, "/d/e/f", pattern(100, i)), EOk)
-    match vol.stat("/d/e")
-        EntOk(en) => test.assert_ne(en.pair0 as Int, first)
-        EntErr(e) => test.fail("stat: " + nvfs.err_str(e))
+        want(file_write(vol, "/d/e/f", pattern(100, i)), EOk)
+    match nvfs.op_stat(dev, "/d/e")
+        AtOk(en) => test.assert_ne(en.pair0 as Int, first)
+        AtErr(e) => test.fail("stat: " + nvfs.err_str(e))
     test.assert_eq(read_all(vol, "/d/e/f"), pattern(100, 29))
     let again = nvfs.mount(vol.unmount())
     test.assert_eq(read_all(again, "/d/e/f"), pattern(100, 29))
@@ -203,8 +472,8 @@ fn test_relocation_stops_where_the_volume_is_full()
     let vol = nvfs.mount(dev)
     want(vol.mkdir("/d"), EOk)
     // the two data blocks left are taken, so the pair cannot move
-    want(hostfs.file_write(vol, "/x", pattern(900, 0)), EOk)
-    want(hostfs.file_write(vol, "/d/f", pattern(10, 1)), EOk)
+    want(file_write(vol, "/x", pattern(900, 0)), EOk)
+    want(file_write(vol, "/d/f", pattern(10, 1)), EOk)
     test.assert_eq(read_all(vol, "/d/f"), pattern(10, 1))
 
 @test
@@ -214,10 +483,10 @@ fn test_relocation_survives_a_block_that_will_not_erase()
     let vol = nvfs.mount(dev)
     want(vol.mkdir("/d"), EOk)
     // the allocator hands out 4 and 5 for the move; neither erases
-    hostdev.ram_mark_bad(4)
-    hostdev.ram_mark_bad(5)
-    want(hostfs.file_write(vol, "/d/f", pattern(10, 1)), EOk)
-    want(hostfs.file_write(vol, "/d/f", pattern(10, 2)), EOk)
+    ram_mark_bad(4)
+    ram_mark_bad(5)
+    want(file_write(vol, "/d/f", pattern(10, 1)), EOk)
+    want(file_write(vol, "/d/f", pattern(10, 2)), EOk)
     test.assert_eq(read_all(vol, "/d/f"), pattern(10, 2))
 
 // ── Superblocks and records written by hand ─────────────────────────
@@ -253,31 +522,31 @@ fn test_the_sealed_block_with_records_wins_over_a_bare_torn_one()
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     // block 1 sealed with a high revision and garbage behind it, as an
     // erase cut short can leave it
-    meta.cache_drop()
+    nvfs.cache_drop()
     let _ = dev.erase(1)
-    let _ = hostdev.prog_bytes(dev,
+    let _ = prog_bytes(dev,
         1,
         0,
         bytes.from_byte_list([9, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]))
-    let _ = hostdev.prog_bytes(dev, 1, 16, bytes.from_byte_list([2, 0, 4, 0, 1, 2, 3, 4, 0, 0, 0, 0, 255, 255, 255, 255]))
+    let _ = prog_bytes(dev, 1, 16, bytes.from_byte_list([2, 0, 4, 0, 1, 2, 3, 4, 0, 0, 0, 0, 255, 255, 255, 255]))
     let vol = nvfs.mount(dev)
     want(vol.status(), EOk)
     test.assert_eq(vol.info().active_meta, 0)
-    want(hostfs.file_write(vol, "/a", pattern(5, 0)), EOk)
+    want(file_write(vol, "/a", pattern(5, 0)), EOk)
     // the same garbage in block 0, with the volume in block 1
     let dev2 = ram(16)
     want(nvfs.format(dev2, nvfs.default_config()), EOk)
     let v2 = nvfs.mount(dev2)
     for i in 0..5
-        want(hostfs.file_write(v2, "/f", pattern(100, i)), EOk)
+        want(file_write(v2, "/f", pattern(100, i)), EOk)
     let d2 = v2.unmount()
-    meta.cache_drop()
+    nvfs.cache_drop()
     let _ = d2.erase(0)
-    let _ = hostdev.prog_bytes(d2,
+    let _ = prog_bytes(d2,
         0,
         0,
         bytes.from_byte_list([9, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]))
-    let _ = hostdev.prog_bytes(d2, 0, 16, bytes.from_byte_list([2, 0, 4, 0, 1, 2, 3, 4, 0, 0, 0, 0, 255, 255, 255, 255]))
+    let _ = prog_bytes(d2, 0, 16, bytes.from_byte_list([2, 0, 4, 0, 1, 2, 3, 4, 0, 0, 0, 0, 255, 255, 255, 255]))
     let v3 = nvfs.mount(d2)
     want(v3.status(), EOk)
     test.assert_eq(v3.info().active_meta, 1)
@@ -287,12 +556,12 @@ fn test_the_sealed_block_with_records_wins_over_a_bare_torn_one()
 fn test_the_higher_revision_wins_and_a_lone_sibling_mounts()
     let vol = fresh(16)
     for i in 0..5
-        want(hostfs.file_write(vol, "/f", pattern(100, i)), EOk)
+        want(file_write(vol, "/f", pattern(100, i)), EOk)
     let dev = vol.unmount()
     let v1 = nvfs.mount(dev)
     test.assert_eq(v1.info().active_meta, 1)
     for i in 0..5
-        want(hostfs.file_write(v1, "/f", pattern(100, i + 10)), EOk)
+        want(file_write(v1, "/f", pattern(100, i + 10)), EOk)
     let d1 = v1.unmount()
     let v2 = nvfs.mount(d1)
     test.assert_eq(v2.info().active_meta, 0)
@@ -300,13 +569,13 @@ fn test_the_higher_revision_wins_and_a_lone_sibling_mounts()
     // rewrite until the volume is in block 1 again
     var n = 20
     for i in 0..10
-        want(hostfs.file_write(v2, "/f", pattern(100, n)), EOk)
+        want(file_write(v2, "/f", pattern(100, n)), EOk)
         if (nvfs.pair_state(v2.dev, 0, 1).blk as Int) == 1
             break
         n = n + 1
     let d2 = v2.unmount()
     // block 0 erased: block 1 alone holds the volume
-    meta.cache_drop()
+    nvfs.cache_drop()
     let _ = d2.erase(0)
     let v3 = nvfs.mount(d2)
     want(v3.status(), EOk)
@@ -335,9 +604,9 @@ fn test_a_directory_entry_naming_erased_blocks_is_corrupt()
     want(v.remove("/x/a"), ECorrupt)
     want(v.remove("/x"), ECorrupt)
     want(v.rename("/x/a", "/x/b"), ECorrupt)
-    want(hostfs.file_write(v, "/x/a", pattern(1, 0)), ECorrupt)
-    want(v.dir_open("/x").err, ECorrupt)
-    match hostfs.file_read(v, "/x/a")
+    want(file_write(v, "/x/a", pattern(1, 0)), ECorrupt)
+    want(v.list("/x").err, ECorrupt)
+    match file_read(v, "/x/a")
         FOk(b)  => test.fail("read under a corrupt directory")
         FErr(e) => want(e, ECorrupt)
     // the walk that marks live blocks passes over the broken pairs
@@ -354,7 +623,7 @@ fn test_a_commit_to_a_pair_that_holds_nothing_is_corrupt()
 @test
 fn test_a_rename_onto_a_name_whose_old_name_is_absent_keeps_the_name()
     let vol = fresh(32)
-    want(hostfs.file_write(vol, "/b", pattern(7, 7)), EOk)
+    want(file_write(vol, "/b", pattern(7, 7)), EOk)
     let dev = vol.unmount()
     // a rename record from "a", which does not exist, onto "b"
     let s = Spec { rtype: 4, kind: 0, a: Span { lo: 1, hi: 2 }, b: Span { lo: 3, hi: 4 }, p0: 0, p1: 0 }
@@ -370,15 +639,15 @@ fn test_a_dirent_shorter_than_its_header_reads_as_empty()
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     // an inline dirent whose name length runs past its payload
     let _ = put_rec(dev, 0, 64, 2, [2, 9, 97])
-    meta.cache_drop()
-    let r = meta.rec_at(dev, 0, 64, 512)
+    nvfs.cache_drop()
+    let r = nvfs.rec_at(dev, 0, 64, 512)
     test.assert(r.ok)
     let en = nvfs.dec_dirent(dev, 0, r)
     test.assert_eq(en.size as Int, 0)
     // a dirent with no payload at all
     let _ = put_rec(dev, 0, 80, 2, [])
-    meta.cache_drop()
-    let r2 = meta.rec_at(dev, 0, 80, 512)
+    nvfs.cache_drop()
+    let r2 = nvfs.rec_at(dev, 0, 80, 512)
     let en2 = nvfs.dec_dirent(dev, 0, r2)
     test.assert_eq(en2.kind as Int, 0)
     test.assert_eq(en2.pair0 as Int, 0)
@@ -388,17 +657,17 @@ fn test_a_dirent_shorter_than_its_header_reads_as_empty()
 @test
 fn test_an_append_the_device_refuses_is_an_io_error()
     let vol = fresh(16)
-    hostdev.ram_mark_bad(0)
-    want(hostfs.file_write(vol, "/a", pattern(5, 0)), EIo)
+    ram_mark_bad(0)
+    want(file_write(vol, "/a", pattern(5, 0)), EIo)
 
 @test
 fn test_a_compaction_the_device_refuses_is_an_io_error()
     let vol = fresh(16)
     for i in 0..4
-        want(hostfs.file_write(vol, "/f", pattern(100, i)), EOk)
+        want(file_write(vol, "/f", pattern(100, i)), EOk)
     // the erase of the sibling fails
-    hostdev.ram_mark_bad(1)
-    want(hostfs.file_write(vol, "/f", pattern(100, 9)), EIo)
+    ram_mark_bad(1)
+    want(file_write(vol, "/f", pattern(100, 9)), EIo)
     test.assert_eq(read_all(vol, "/f"), pattern(100, 3))
 
 @test
@@ -407,18 +676,18 @@ fn test_a_compaction_cut_at_each_step_keeps_the_old_state()
     // at each of them in turn
     let vol = fresh(16)
     for i in 0..4
-        want(hostfs.file_write(vol, "/f", pattern(100, i)), EOk)
-    hostdev.ram_op_count_reset()
-    want(hostfs.file_write(vol, "/f", pattern(100, 9)), EOk)
-    let n = hostdev.ram_op_count_get()
+        want(file_write(vol, "/f", pattern(100, i)), EOk)
+    ram_op_count_reset()
+    want(file_write(vol, "/f", pattern(100, 9)), EOk)
+    let n = ram_op_count_get()
     test.assert(n >= 3)
     for k in 1..n + 1
         let v = fresh(16)
         for i in 0..4
-            want(hostfs.file_write(v, "/f", pattern(100, i)), EOk)
-        hostdev.ram_schedule_cut(k, -1)
-        let r = hostfs.file_write(v, "/f", pattern(100, 9))
-        hostdev.ram_clear_cut()
+            want(file_write(v, "/f", pattern(100, i)), EOk)
+        ram_schedule_cut(k, -1)
+        let r = file_write(v, "/f", pattern(100, 9))
+        ram_clear_cut()
         want(r, EIo)
         let again = nvfs.mount(v.unmount())
         want(again.status(), EOk)
@@ -437,7 +706,7 @@ fn test_a_sync_the_device_refuses()
     want(nvfs.format(d1, nvfs.default_config()), EOk)
     let v1 = nvfs.mount(d1)
     syncs_left = 0
-    want(hostfs.file_write(v1, "/a", pattern(5, 0)), EIo)
+    want(file_write(v1, "/a", pattern(5, 0)), EIo)
     faults_off()
     // a compaction, before and after its seal
     for k in 0..2
@@ -445,16 +714,16 @@ fn test_a_sync_the_device_refuses()
         want(nvfs.format(d2, nvfs.default_config()), EOk)
         let v2 = nvfs.mount(d2)
         for i in 0..4
-            want(hostfs.file_write(v2, "/f", pattern(100, i)), EOk)
+            want(file_write(v2, "/f", pattern(100, i)), EOk)
         syncs_left = k
-        want(hostfs.file_write(v2, "/f", pattern(100, 9)), EIo)
+        want(file_write(v2, "/f", pattern(100, 9)), EIo)
         faults_off()
     // a chain's last sync
     let d3 = FaultFlash { ram: ram(16) }
     want(nvfs.format(d3, nvfs.default_config()), EOk)
     let v3 = nvfs.mount(d3)
     syncs_left = 0
-    want(hostfs.file_write(v3, "/big", pattern(700, 0)), EIo)
+    want(file_write(v3, "/big", pattern(700, 0)), EIo)
     faults_off()
 
 @test
@@ -474,14 +743,14 @@ fn test_reads_that_fail_part_way()
         want(nvfs.format(dev, nvfs.default_config()), EOk)
         let vol = nvfs.mount(dev)
         want(vol.mkdir("/d"), EOk)
-        want(hostfs.file_write(vol, "/d/s", pattern(50, 1)), EOk)
-        want(hostfs.file_write(vol, "/d/c", pattern(1200, 2)), EOk)
+        want(file_write(vol, "/d/s", pattern(50, 1)), EOk)
+        want(file_write(vol, "/d/c", pattern(1200, 2)), EOk)
         let v = nvfs.mount(vol.unmount())
         reads_left = k
-        let _ = hostfs.file_read(v, "/d/c")
-        let _ = hostfs.file_read(v, "/d/s")
-        let _ = hostfs.dir_list(v, "/d")
-        let _ = hostfs.file_append(v, "/d/c", pattern(10, 0))
+        let _ = file_read(v, "/d/c")
+        let _ = file_read(v, "/d/s")
+        let _ = dir_list(v, "/d")
+        let _ = file_append(v, "/d/c", pattern(10, 0))
         let _ = v.file_truncate("/d/c", 700)
         let _ = v.rename("/d/s", "/d/t")
         let _ = v.used_blocks()
@@ -489,27 +758,27 @@ fn test_reads_that_fail_part_way()
 
 // A volume whose root is one rewrite from a compaction and whose
 // directory /d/e moves to fresh blocks on every commit.
-fn moving_volume(rs: Int, ps: Int, bs: Int) -> Volume<FaultFlash> [mutate, ffi]
+fn moving_volume(rs: Int, ps: Int, bs: Int) -> Volume<FaultFlash> [mutate]
     ram_recycle()
     faults_off()
     nvfs.wear_reset()
-    let dev = FaultFlash { ram: hostdev.ram_flash(rs, ps, bs, 32) }
+    let dev = FaultFlash { ram: ram_flash(rs, ps, bs, 32) }
     want(nvfs.format(dev, cfg_with(1)), EOk)
     let vol = nvfs.mount(dev)
     want(vol.mkdir("/d"), EOk)
     want(vol.mkdir("/d/e"), EOk)
-    want(hostfs.file_write(vol, "/d/e/s", pattern(60, 1)), EOk)
-    want(hostfs.file_write(vol, "/d/e/c", pattern(700, 2)), EOk)
+    want(file_write(vol, "/d/e/s", pattern(60, 1)), EOk)
+    want(file_write(vol, "/d/e/c", pattern(700, 2)), EOk)
     for i in 0..(bs - 64) / 112
-        want(hostfs.file_write(vol, "/f", pattern(100, i)), EOk)
+        want(file_write(vol, "/f", pattern(100, i)), EOk)
     nvfs.mount(vol.unmount())
 
-fn moving_work(v: Volume<FaultFlash>) [mutate, ffi]
-    let _ = hostfs.file_write(v, "/f", pattern(100, 9))
-    let _ = hostfs.file_write(v, "/d/e/s", pattern(60, 9))
-    let _ = hostfs.file_append(v, "/d/e/s", pattern(10, 0))
+fn moving_work(v: Volume<FaultFlash>) [mutate]
+    let _ = file_write(v, "/f", pattern(100, 9))
+    let _ = file_write(v, "/d/e/s", pattern(60, 9))
+    let _ = file_append(v, "/d/e/s", pattern(10, 0))
     let _ = v.file_truncate("/d/e/s", 20)
-    let _ = hostfs.file_read(v, "/d/e/c")
+    let _ = file_read(v, "/d/e/c")
 
 @test
 fn test_reads_that_fail_part_way_through_a_compaction_and_a_move()
@@ -541,16 +810,16 @@ fn test_reads_that_fail_part_way_through_a_mount()
         ram_recycle()
         faults_off()
         nvfs.wear_reset()
-        var ramdev = hostdev.ram_flash(16, 16, 512, 16)
+        var ramdev = ram_flash(16, 16, 512, 16)
         var files = 3
         if g == 1
-            ramdev = hostdev.ram_flash(1, 1, 2048, 16)
+            ramdev = ram_flash(1, 1, 2048, 16)
             files = 20
         want(nvfs.format(ramdev, nvfs.default_config()), EOk)
         let vol = nvfs.mount(ramdev)
         want(vol.mkdir("/d"), EOk)
         for i in 0..files
-            want(hostfs.file_write(vol, "/a" + str.from_int(i), pattern(50 + i, i)), EOk)
+            want(file_write(vol, "/a" + str.from_int(i), pattern(50 + i, i)), EOk)
         let dev = FaultFlash { ram: vol.unmount() }
         reads_done = 0
         let _ = nvfs.mount(dev).status()
@@ -573,7 +842,7 @@ fn hand_rename<D: Flash[e]>(dev: D, old: Str, new: Str) -> FsError [mutate, e]
 @test
 fn test_a_rename_chain_through_an_absent_name_backs_out_a_level()
     let vol = fresh(32)
-    want(hostfs.file_write(vol, "/b", pattern(6, 6)), EOk)
+    want(file_write(vol, "/b", pattern(6, 6)), EOk)
     let dev = vol.unmount()
     // y, which never existed, onto b; then b onto c
     want(hand_rename(dev, "y", "b"), EOk)
@@ -595,7 +864,7 @@ fn test_renames_from_an_absent_name_stop_at_the_depth_bound()
     ram_recycle()
     faults_off()
     nvfs.wear_reset()
-    let dev = hostdev.ram_flash(16, 16, 4096, 16)
+    let dev = ram_flash(16, 16, 4096, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     for i in 0..40
         want(hand_rename(dev, "y", "a"), EOk)
@@ -611,11 +880,11 @@ fn test_a_record_header_that_straddles_two_read_windows()
     ram_recycle()
     faults_off()
     nvfs.wear_reset()
-    let ramdev = hostdev.ram_flash(1, 1, 2048, 8)
+    let ramdev = ram_flash(1, 1, 2048, 8)
     want(nvfs.format(ramdev, nvfs.default_config()), EOk)
     let vol = nvfs.mount(ramdev)
     for i in 10..50
-        want(hostfs.file_write(vol, "/a" + str.from_int(i), pattern(17, i)), EOk)
+        want(file_write(vol, "/a" + str.from_int(i), pattern(17, i)), EOk)
     let dev = FaultFlash { ram: vol.unmount() }
     let v0 = nvfs.mount(dev)
     reads_done = 0

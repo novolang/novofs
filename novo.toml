@@ -1,21 +1,23 @@
 [package]
 name        = "novofs"
-version     = "0.2.1"
-description = "A power-loss-resilient filesystem for NOR flash, written in novo-lang and modelled on littlefs: a Flash trait with RAM, image-file, block-device and board-region devices, copy-on-write metadata pairs, CRC-checked commits, CTZ skip-list files, a mounted volume that owns its device, and an image tool (mk, ls, cat, extract, fsck, df)."
+version     = "0.3.0"
+description = "A power-loss-resilient filesystem for a microcontroller's NOR flash, written in novo-lang and modelled on littlefs: a Flash trait a device implements, the device over a board's reserved flash region, copy-on-write metadata pairs, CRC-checked commits, CTZ skip-list files, and a mounted volume whose operations each take a path."
 license     = "Apache-2.0"
 category    = "embedded"
-layer       = "app"
+layer       = "host"
 stability   = "experimental"
 tags        = ["embedded", "filesystem", "flash", "littlefs", "nor", "power-loss"]
 repository  = "https://github.com/novolang/novofs"
 maintainers = ["novo-lang"]
-main        = "src/main.nv"
-# The toolchain floor: `Volume<D: Flash[e]>` binds its bound's effect
-# parameter on a struct's type parameter (SPEC § 5.6, "A struct binds it
-# too"), which 0.20.0 first accepts.
-novo        = ">= 0.20.0"
+# The toolchain floor: the volume implements `FileSystem[mutate, e]`,
+# forwarding the effect parameter its struct binds on `D: Flash[e]`
+# (SPEC § 5.6, "An impl forwards it"), which 0.20.1 first accepts.
+novo        = ">= 0.20.1"
+
+# A library: no `main`.  The image tool, the RAM and image-file devices
+# and the host's view of a volume are the novofs-tools package.
 
 [dependencies]
-# The BlockDevice trait, from embedded-hal-nv, for the block-device
-# adapter (haladapt.nv), whose read_block fills a caller's buffer.
-embedded-hal-nv = "^0.2.0"
+# CRC-32C, which every record carries, from crc-nv's functions that
+# need no heap.
+crc-nv = "^0.1.6"

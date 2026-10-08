@@ -4,14 +4,13 @@
 
 use std.test
 
-use crc32
-use meta
 use nvfs
+use crc
 
 fn crc_of(s: Str) -> Int
     var c = 0xFFFFFFFF
     for i in 0..str.len(s)
-        c = crc32.update(c, str.byte_at_or(s, i, 0))
+        c = crc.crc32c_step(c, str.byte_at_or(s, i, 0))
     c ^ 0xFFFFFFFF
 
 @test
@@ -21,10 +20,10 @@ fn test_crc32c_check_value()
 
 @test
 fn test_a_record_pads_to_the_prog_page()
-    test.assert_eq(meta.rec_size(32, 16), 48)
-    test.assert_eq(meta.rec_size(8, 16), 16)
-    test.assert_eq(meta.rec_size(9, 1), 17)
-    test.assert_eq(meta.align_up(52, 16), 64)
+    test.assert_eq(nvfs.rec_size(32, 16), 48)
+    test.assert_eq(nvfs.rec_size(8, 16), 16)
+    test.assert_eq(nvfs.rec_size(9, 1), 17)
+    test.assert_eq(nvfs.align_up(52, 16), 64)
 
 @test
 fn test_path_components_drop_empty_ones()

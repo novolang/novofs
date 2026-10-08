@@ -1,0 +1,88 @@
+// examples/logger.nv — a log of readings appended to a file, one
+// record at a time, that carries on where it left off after a reset.
+//
+//   novo build --target=nrf52832-dk examples/logger.nv
+//   novo flash --target=nrf52832-dk logger.elf
+//
+// Each record is four bytes, a sequence number and a reading, appended
+// to `/log` as one commit.  A reset in the middle of an append leaves
+// the log as it was before the append or as it is after it.  At start
+// the program reads the last record to find the sequence number to
+// carry on from.  When the volume is full the log starts again from
+// the record that did not fit.
+//
+// The reading here is a stand-in computed from the sequence number; a
+// program with a sensor writes its sample instead.  The program appends
+// five records, one every 200 ms, and prints the log's size.  It
+// prints, over the board's console:
+//
+//   logger: resumed after record 10
+//   logger: appended 11 reading 33
+//   ...
+//   logger: appended 15 reading 45
+//   logger: /log holds 15 records
+
+use nvfs
+
+// A record's bytes: the sequence number and the reading, 16 bits each,
+// low byte first.
+@value
+struct Record
+    seq: Int
+    reading: Int
+
+impl ByteSrc for Record
+    fn src_len(self) -> Int
+        4
+
+    fn src_at(self, i: Int) -> Int
+        if i < 2
+            (self.seq >>> (8 * i)) & 255
+        else
+            (self.reading >>> (8 * (i - 2))) & 255
+
+// The sequence number of the last record in the log, 0 for none.
+fn last_seq<D: Flash[e]>(vol: Volume<D>) -> Int [mutate, e]
+    let size = vol.file_size("/log")
+    if size < 4
+        return 0
+    var buf: Buf = Vec.new()
+    if vol.file_read_at("/log", size - 4, 4, buf) != EOk
+        return 0
+    buf[0] as Int | (buf[1] as Int << 8)
+
+fn main() [hw, mutate, time]
+    bsp.board.init()
+    let vol = nvfs.mount_with(nvfs.region_flash(), nvfs.default_config(), true)
+    if vol.status() != EOk
+        hal.uart.write("logger: mount failed: ")
+        hal.uart.write(nvfs.err_str(vol.status()))
+        hal.uart.write("\n")
+        return
+    var seq = last_seq(vol)
+    hal.uart.write("logger: resumed after record ")
+    hal.uart.write(str.from_int(seq))
+    hal.uart.write("\n")
+    for step in 0..5
+        seq = seq + 1
+        let r = Record { seq: seq, reading: seq * 3 % 1000 }
+        var rc = vol.file_append("/log", r)
+        if rc == ENoSpace
+            // A full volume: the log starts again from this record.
+            rc = vol.file_write("/log", r)
+        if rc != EOk
+            hal.uart.write("logger: append failed: ")
+            hal.uart.write(nvfs.err_str(rc))
+            hal.uart.write("\n")
+            return
+        hal.uart.write("logger: appended ")
+        hal.uart.write(str.from_int(r.seq))
+        hal.uart.write(" reading ")
+        hal.uart.write(str.from_int(r.reading))
+        hal.uart.write("\n")
+        core.rt.sleep_ms(200)
+    hal.uart.write("logger: /log holds ")
+    hal.uart.write(str.from_int(vol.file_size("/log") / 4))
+    hal.uart.write(" records\n")
+    loop
+        core.rt.sleep_ms(1000)

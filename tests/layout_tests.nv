@@ -3,14 +3,282 @@
 // the kept scans, records a scan rejects, devices with small and large
 // pages and blocks, the allocator's retries and its walk's bounds.
 
-use std.test
 use std.bytes
+use std.list
+use std.test
 
-use flash
-use hostdev
-use meta
 use nvfs
-use hostfs
+
+// ── The suite's RAM device ──────────────────────────────────────────
+//
+// RamFlash keeps its cells in one module-level list, each device its
+// own run of `bs * bc` cells from `h`.  It enforces NOR rules: offsets
+// and lengths are whole units, a prog ANDs its bytes into the cells, and
+// an erase sets a block to 0xFF.  It carries the wear counters, the
+// bad-block set and the power-cut schedule of the most recent device.
+// A suite file is a program of its own, so each suite that needs a
+// device carries this block.
+
+var ram_cells: [Int]  = []
+var ram_counts: [Int] = []
+var ram_bad: [Int]    = []
+var ram_nblocks       = 0
+var ram_last_h        = 0 - 1
+var ram_ops_left      = 0 - 1   // -1: no cut scheduled; 0: power is off
+var ram_tear          = 0 - 1
+var ram_op_count      = 0
+
+struct RamFlash
+    h: Int
+    rs: Int
+    ps: Int
+    bs: Int
+    bc: Int
+
+// Releases the most recent device's cells; a device made after it
+// reuses them.
+fn ram_recycle() [mutate]
+    if ram_last_h >= 0
+        ram_cells = list.take(ram_cells, ram_last_h)
+        ram_last_h = 0 - 1
+
+// A RamFlash of `bc` blocks of `bs` bytes, read in units of `rs` and
+// programmed in pages of `ps`, every byte erased to 0xFF.  It resets the
+// wear counters, the bad blocks and the power-cut schedule.
+fn ram_flash(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash [mutate]
+    ram_counts = list.map(list.range(0, bc), i => 0)
+    ram_bad = list.map(list.range(0, bc), i => 0)
+    ram_nblocks = bc
+    ram_ops_left = 0 - 1
+    ram_tear = 0 - 1
+    ram_op_count = 0
+    // The new device's cells follow the others, erased.  The list is
+    // made again rather than extended: list.concat onto this
+    // module-level list leaks one list (novo-lang bug
+    // module-var-list-concat-leaks).
+    let h = list.len(ram_cells)
+    let before = ram_cells
+    ram_cells = list.map(list.range(0, h + bs * bc), i => (if i < h then before[i] else 255))
+    ram_last_h = h
+    RamFlash { h: h, rs: rs, ps: ps, bs: bs, bc: bc }
+
+// Of the next progs and erases, `after_ops - 1` succeed and the next is
+// cut: with `tear` below 0 it applies nothing, otherwise a prog applies
+// its first `tear` bytes and an erase erases the first half of its
+// block.  Every operation after the cut fails until `ram_clear_cut`.
+fn ram_schedule_cut(after_ops: Int, tear: Int) [mutate]
+    ram_ops_left = after_ops
+    ram_tear = tear
+
+fn ram_clear_cut() [mutate]
+    ram_ops_left = 0 - 1
+    ram_tear = 0 - 1
+
+fn ram_op_count_get() -> Int [mutate]
+    ram_op_count
+
+fn ram_op_count_reset() [mutate]
+    ram_op_count = 0
+
+// 0: proceed; 1: this operation is the cut; 2: power is off.
+fn ram_cut_gate() -> Int [mutate]
+    if ram_ops_left < 0
+        0
+    else if ram_ops_left == 0
+        2
+    else
+        ram_ops_left = ram_ops_left - 1
+        if ram_ops_left == 0
+            1
+        else
+            0
+
+fn ram_mark_bad(b: Int) [mutate]
+    if b >= 0 and b < ram_nblocks
+        ram_bad[b] = 1
+
+fn ram_is_bad(b: Int) -> Bool [mutate]
+    b >= 0 and b < ram_nblocks and ram_bad[b] == 1
+
+fn ram_erase_count(b: Int) -> Int [mutate]
+    if b >= 0 and b < ram_nblocks
+        ram_counts[b]
+    else
+        0
+
+impl Flash[mutate] for RamFlash
+    fn read_size(self) -> Int
+        self.rs
+
+    fn prog_size(self) -> Int
+        self.ps
+
+    fn block_size(self) -> Int
+        self.bs
+
+    fn block_count(self) -> Int
+        self.bc
+
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate]
+        dst.clear()
+        if block < 0 or block >= self.bc or off < 0 or len < 0 or len > BUF_CAP
+            false
+        else if off + len > self.bs or off % self.rs != 0 or len % self.rs != 0
+            false
+        else
+            let base = self.h + block * self.bs + off
+            for i in 0..len
+                let _ = dst.push(ram_cells[base + i] as u8)
+            true
+
+    fn prog(self, block: Int, off: Int, var data: Buf) -> Bool [mutate]
+        let len = data.len()
+        if block < 0 or block >= self.bc or off < 0
+            false
+        else if off + len > self.bs or off % self.ps != 0 or len % self.ps != 0
+            false
+        else if ram_is_bad(block)
+            false
+        else
+            let base = self.h + block * self.bs + off
+            let gate = ram_cut_gate()
+            if gate == 2
+                false
+            else if gate == 1
+                var t = ram_tear
+                if t > len
+                    t = len
+                for it in 0..t
+                    ram_cells[base + it] = ram_cells[base + it] & data[it] as Int
+                false
+            else
+                for i in 0..len
+                    ram_cells[base + i] = ram_cells[base + i] & data[i] as Int
+                ram_op_count = ram_op_count + 1
+                true
+
+    fn erase(self, block: Int) -> Bool [mutate]
+        if block < 0 or block >= self.bc
+            false
+        else if ram_is_bad(block)
+            false
+        else
+            let base = self.h + block * self.bs
+            let gate = ram_cut_gate()
+            if gate == 2
+                false
+            else if gate == 1
+                for ih in 0..self.bs / 2
+                    ram_cells[base + ih] = 255
+                false
+            else
+                for i in 0..self.bs
+                    ram_cells[base + i] = 255
+                ram_counts[block] = ram_counts[block] + 1
+                ram_op_count = ram_op_count + 1
+                true
+
+    fn sync(self) -> Bool
+        true
+
+// Programs `data` at (block, off) through any device.
+fn prog_bytes<D: Flash[e]>(dev: D, block: Int, off: Int, data: Bytes) -> Bool [e]
+    var buf: Buf = Vec.new()
+    for i in 0..bytes.len(data)
+        let _ = buf.push((bytes.byte_at(data, i) ?? 0) as u8)
+    dev.prog(block, off, buf)
+
+// The `len` bytes at (block, off) of any device, or None.
+fn read_bytes<D: Flash[e]>(dev: D, block: Int, off: Int, len: Int) -> ?Bytes [e]
+    var buf: Buf = Vec.new()
+    if not dev.read(block, off, len, buf)
+        return None
+    var out = bytes.zeros(buf.len())
+    for i in 0..buf.len()
+        out = bytes.set_u8(out, i, buf[i] as Int)
+    Some(out)
+
+// ── Whole files and listings, over the volume's operations ─────────
+
+// A Bytes as a source, so a test writes one in a call.  It wraps the
+// Bytes because an impl for Bytes itself, written here, is not reached
+// from the package's generic code (novo-lang bug
+// impl-for-bytes-in-another-module-not-dispatched).
+struct BytesSrc
+    b: Bytes
+
+impl ByteSrc for BytesSrc
+    fn src_len(self) -> Int
+        bytes.len(self.b)
+
+    fn src_at(self, i: Int) -> Int
+        bytes.byte_at(self.b, i) ?? 0
+
+enum FileRes
+    FOk(data: Bytes)
+    FErr(e: FsError)
+
+struct DirEntry
+    name: Str
+    is_dir: Bool
+    size: Int
+
+enum DirListRes
+    DLOk(entries: [DirEntry])
+    DLErr(e: FsError)
+
+fn file_write<D: Flash[e]>(vol: Volume<D>, path: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_write(path, BytesSrc { b: data })
+
+fn file_append<D: Flash[e]>(vol: Volume<D>, path: Str, data: Bytes) -> FsError [mutate, e]
+    vol.file_append(path, BytesSrc { b: data })
+
+// `len` bytes of `path` from `off`, a Buf at a time.  A range past the
+// end of the file answers EInvalidConfig, and a directory EIsDir.
+fn file_read_at<D: Flash[e]>(vol: Volume<D>, path: Str, off: Int, len: Int) -> FileRes [mutate, e]
+    match vol.stat(path)
+        EntErr(err) => FErr(err)
+        EntOk(en)   =>
+            if en.is_dir
+                return FErr(EIsDir)
+            if off < 0 or len < 0 or off + len > en.size
+                return FErr(EInvalidConfig)
+            var out = bytes.zeros(len)
+            var buf: Buf = Vec.new()
+            for chunk in 0..(len + BUF_CAP - 1) / BUF_CAP
+                let at = chunk * BUF_CAP
+                var n = len - at
+                if n > BUF_CAP
+                    n = BUF_CAP
+                let r = vol.file_read_at(path, off + at, n, buf)
+                if r != EOk
+                    return FErr(r)
+                for k in 0..n
+                    out = bytes.set_u8(out, at + k, buf[k] as Int)
+            FOk(out)
+
+// The whole of `path`, or why it cannot be read.
+fn file_read<D: Flash[e]>(vol: Volume<D>, path: Str) -> FileRes [mutate, e]
+    match vol.stat(path)
+        EntErr(err) => FErr(err)
+        EntOk(en)   => file_read_at(vol, path, 0, en.size)
+
+// The entries of `path`, in the order the directory holds them.
+fn dir_list<D: Flash[e]>(vol: Volume<D>, path: Str) -> DirListRes [mutate, e]
+    var at = vol.list(path)
+    if at.err != EOk
+        return DLErr(at.err)
+    var es: [DirEntry] = []
+    while true
+        match vol.list_next(at)
+            Some(en) =>
+                es = list.push(es, DirEntry { name: en.name_str(), is_dir: en.is_dir, size: en.size })
+            None     =>
+                break
+    DLOk(es)
+
+fn entry_size(e: DirEntry) -> Int
+    e.size
 
 fn want(got: FsError, exp: FsError)
     test.assert_eq_str(nvfs.err_str(got), nvfs.err_str(exp))
@@ -18,13 +286,13 @@ fn want(got: FsError, exp: FsError)
 fn pattern(n: Int, seed: Int) -> Bytes
     bytes.from_byte_list(list.map(list.range(0, n), i => (seed + i) % 251))
 
-fn ram(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash [mutate, ffi]
+fn ram(rs: Int, ps: Int, bs: Int, bc: Int) -> RamFlash [mutate]
     ram_recycle()
     nvfs.wear_reset()
-    hostdev.ram_flash(rs, ps, bs, bc)
+    ram_flash(rs, ps, bs, bc)
 
 fn read_all<D: Flash[e]>(vol: Volume<D>, p: Str) -> Bytes [mutate, e]
-    match hostfs.file_read(vol, p)
+    match file_read(vol, p)
         FOk(b)  => b
         FErr(e) => bytes.from_byte_list([255, 255, 255])
 
@@ -89,7 +357,7 @@ fn test_a_component_past_the_last_is_empty()
 
 @test
 fn test_the_empty_source()
-    let s = flash.no_src()
+    let s = nvfs.no_src()
     test.assert_eq(s.src_len(), 0)
     test.assert_eq(s.src_at(3), 0)
 
@@ -98,44 +366,44 @@ fn test_the_empty_source()
 @test
 fn test_reads_outside_a_block_answer_minus_one()
     let dev = ram(16, 16, 512, 4)
-    meta.cache_drop()
-    test.assert_eq(meta.rd8(dev, 0, -1), -1)
-    test.assert_eq(meta.rd8(dev, 0, 512), -1)
-    test.assert_eq(meta.rd16(dev, 0, 511), -1)
-    test.assert_eq(meta.rd32(dev, 0, 510), -1)
-    test.assert_eq(meta.rd8(dev, 9, 0), -1)
-    test.assert_eq(meta.crc_range(dev, 9, 0, 8), -1)
+    nvfs.cache_drop()
+    test.assert_eq(nvfs.rd8(dev, 0, -1), -1)
+    test.assert_eq(nvfs.rd8(dev, 0, 512), -1)
+    test.assert_eq(nvfs.rd16(dev, 0, 511), -1)
+    test.assert_eq(nvfs.rd32(dev, 0, 510), -1)
+    test.assert_eq(nvfs.rd8(dev, 9, 0), -1)
+    test.assert_eq(nvfs.crc_range(dev, 9, 0, 8), -1)
     // a device whose read unit is wider than a short window
     let wide = ram(64, 16, 512, 4)
-    meta.cache_drop()
-    test.assert_eq(meta.rd_win(wide, 0, 70, 32), 255)
+    nvfs.cache_drop()
+    test.assert_eq(nvfs.rd_win(wide, 0, 70, 32), 255)
 
 @test
 fn test_a_scan_filed_over_a_kept_one_replaces_it()
     let dev = ram(16, 16, 512, 4)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
-    meta.cache_drop()
-    let s0 = meta.scan(dev, 0)
-    let s1 = meta.scan(dev, 1)
+    nvfs.cache_drop()
+    let s0 = nvfs.scan(dev, 0)
+    let s1 = nvfs.scan(dev, 1)
     test.assert(s0.valid)
     test.assert_false(s1.valid, "block 1 is erased")
-    let note = meta.scan_of(7, 64, 16)
-    meta.scan_note(0, note)
-    test.assert_eq(meta.scan(dev, 0).rev as Int, 7)
-    meta.scan_note(1, note)
-    test.assert_eq(meta.scan(dev, 1).rev as Int, 7)
+    let note = nvfs.scan_of(7, 64, 16)
+    nvfs.scan_note(0, note)
+    test.assert_eq(nvfs.scan(dev, 0).rev as Int, 7)
+    nvfs.scan_note(1, note)
+    test.assert_eq(nvfs.scan(dev, 1).rev as Int, 7)
     // a third block takes the older place, then the other
-    let _ = meta.scan(dev, 2)
-    let _ = meta.scan(dev, 3)
-    test.assert_eq(meta.scan(dev, 2).rev as Int, 0)
+    let _ = nvfs.scan(dev, 2)
+    let _ = nvfs.scan(dev, 3)
+    test.assert_eq(nvfs.scan(dev, 2).rev as Int, 0)
 
 @test
 fn test_ownership_of_the_kept_state()
-    meta.cache_drop()
-    test.assert(meta.claim(41))
-    test.assert_false(meta.claim(41), "the owner claims again")
-    test.assert_false(meta.release(42), "a volume that does not own it")
-    test.assert(meta.release(41))
+    nvfs.cache_drop()
+    test.assert(nvfs.claim(41))
+    test.assert_false(nvfs.claim(41), "the owner claims again")
+    test.assert_false(nvfs.release(42), "a volume that does not own it")
+    test.assert(nvfs.release(41))
 
 // ── Records a scan rejects ──────────────────────────────────────────
 
@@ -144,9 +412,9 @@ fn test_a_record_longer_than_its_block_ends_the_log()
     let dev = ram(16, 16, 512, 4)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     // a header claiming 511 bytes of payload after the superblock
-    let _ = hostdev.prog_bytes(dev, 0, 64, bytes.from_byte_list([2, 0, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-    meta.cache_drop()
-    let s = meta.scan_block(dev, 0)
+    let _ = prog_bytes(dev, 0, 64, bytes.from_byte_list([2, 0, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+    nvfs.cache_drop()
+    let s = nvfs.scan_block(dev, 0)
     test.assert(s.valid)
     test.assert(s.torn)
     test.assert_eq(s.limit as Int, 56)
@@ -154,7 +422,7 @@ fn test_a_record_longer_than_its_block_ends_the_log()
     // the volume still mounts and writes go to the sibling
     let vol = nvfs.mount(dev)
     want(vol.status(), EOk)
-    want(hostfs.file_write(vol, "/a", pattern(5, 0)), EOk)
+    want(file_write(vol, "/a", pattern(5, 0)), EOk)
     test.assert_eq(vol.info().active_meta, 0)
     let again = nvfs.mount(vol.unmount())
     test.assert_eq(again.info().active_meta, 1)
@@ -166,12 +434,12 @@ fn test_a_record_longer_than_its_block_ends_the_log()
 fn test_a_device_with_four_byte_pages()
     let dev = ram(4, 4, 512, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
-    test.assert_eq(meta.meta_off(dev), 4)
+    test.assert_eq(nvfs.meta_off(dev), 4)
     let vol = nvfs.mount(dev)
     want(vol.mkdir("/d"), EOk)
-    want(hostfs.file_write(vol, "/d/a", pattern(300, 1)), EOk)
+    want(file_write(vol, "/d/a", pattern(300, 1)), EOk)
     for i in 0..8
-        want(hostfs.file_write(vol, "/s", pattern(90, i)), EOk)
+        want(file_write(vol, "/s", pattern(90, i)), EOk)
     test.assert_eq(read_all(vol, "/d/a"), pattern(300, 1))
     test.assert_eq(read_all(vol, "/s"), pattern(90, 7))
 
@@ -180,7 +448,7 @@ fn test_a_device_with_blocks_larger_than_a_buffer()
     let dev = ram(16, 16, 2048, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     let vol = nvfs.mount(dev)
-    want(hostfs.file_write(vol, "/big", pattern(5000, 3)), EOk)
+    want(file_write(vol, "/big", pattern(5000, 3)), EOk)
     test.assert_eq(read_all(vol, "/big"), pattern(5000, 3))
     want(vol.file_truncate("/big", 2100), EOk)
     test.assert_eq(read_all(vol, "/big"), pattern(2100, 3))
@@ -190,7 +458,7 @@ fn test_a_long_chain_of_renames_in_one_block()
     let dev = ram(16, 16, 4096, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     let vol = nvfs.mount(dev)
-    want(hostfs.file_write(vol, "/a", pattern(9, 9)), EOk)
+    want(file_write(vol, "/a", pattern(9, 9)), EOk)
     for i in 0..20
         want(vol.rename("/a", "/b"), EOk)
         want(vol.rename("/b", "/a"), EOk)
@@ -204,31 +472,31 @@ fn test_mkdir_retires_a_block_that_will_not_erase_and_retries()
     let dev = ram(16, 16, 512, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     for b in 2..16
-        hostdev.ram_mark_bad(b)
+        ram_mark_bad(b)
     want(nvfs.mount(dev).mkdir("/d"), EIo)
     // one bad block among good ones: the retry takes another
     for bad in 2..16
         let d2 = ram(16, 16, 512, 16)
         want(nvfs.format(d2, nvfs.default_config()), EOk)
-        hostdev.ram_mark_bad(bad)
+        ram_mark_bad(bad)
         let vol = nvfs.mount(d2)
         want(vol.mkdir("/d"), EOk)
         want(vol.mkdir("/e"), EOk)
-        want(hostfs.file_write(vol, "/e/f", pattern(10, 0)), EOk)
+        want(file_write(vol, "/e/f", pattern(10, 0)), EOk)
 
 @test
 fn test_a_chain_retires_blocks_that_will_not_erase()
     let dev = ram(16, 16, 512, 16)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     for b in 2..16
-        hostdev.ram_mark_bad(b)
-    want(hostfs.file_write(nvfs.mount(dev), "/c", pattern(700, 0)), EIo)
+        ram_mark_bad(b)
+    want(file_write(nvfs.mount(dev), "/c", pattern(700, 0)), EIo)
     for bad in 2..16
         let d2 = ram(16, 16, 512, 16)
         want(nvfs.format(d2, nvfs.default_config()), EOk)
-        hostdev.ram_mark_bad(bad)
+        ram_mark_bad(bad)
         let vol = nvfs.mount(d2)
-        want(hostfs.file_write(vol, "/c", pattern(1500, 0)), EOk)
+        want(file_write(vol, "/c", pattern(1500, 0)), EOk)
         test.assert_eq(read_all(vol, "/c"), pattern(1500, 0))
 
 @test
@@ -238,12 +506,12 @@ fn test_a_two_block_device_has_room_for_inline_files_only()
     want(nvfs.format(big, nvfs.default_config()), EOk)
     let _ = nvfs.mount(big)
     ram_recycle()
-    let dev = hostdev.ram_flash(16, 16, 512, 2)
+    let dev = ram_flash(16, 16, 512, 2)
     want(nvfs.format(dev, nvfs.default_config()), EOk)
     let vol = nvfs.mount(dev)
-    want(hostfs.file_write(vol, "/s", pattern(20, 0)), EOk)
+    want(file_write(vol, "/s", pattern(20, 0)), EOk)
     want(vol.mkdir("/d"), ENoSpace)
-    want(hostfs.file_write(vol, "/c", pattern(200, 0)), ENoSpace)
+    want(file_write(vol, "/c", pattern(200, 0)), ENoSpace)
 
 @test
 fn test_a_directory_that_contains_itself_does_not_hold_the_walk()
@@ -254,5 +522,5 @@ fn test_a_directory_that_contains_itself_does_not_hold_the_walk()
     want(nvfs.commit(dev, 0, 1, s, "/loop", "/loop", stage), EOk)
     let vol = nvfs.mount(dev)
     test.assert_eq(vol.used_blocks(), 2)
-    want(hostfs.file_write(vol, "/loop/loop/f", pattern(700, 0)), EOk)
+    want(file_write(vol, "/loop/loop/f", pattern(700, 0)), EOk)
     test.assert_eq(read_all(vol, "/f"), pattern(700, 0))

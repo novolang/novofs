@@ -1,0 +1,81 @@
+// examples/settings.nv — a record kept in the board's flash across
+// resets.
+//
+//   novo build --target=nrf52832-dk examples/settings.nv
+//   novo flash --target=nrf52832-dk settings.elf
+//
+// The program mounts the board's data region, formatting it on the
+// first boot, and reads `/settings`, a record of two numbers: how many
+// times the board has started, and a sample rate.  It writes the record
+// back with the count one higher and reads it again.  Each reset of the
+// board starts it again, and the count it prints goes up by one, so the
+// record survived the reset.
+//
+// It prints, over the board's console:
+//
+//   settings: mounted
+//   settings: boots=3 rate=100
+//   settings: read back boots=3 rate=100
+
+use nvfs
+
+// The record: two 32-bit little-endian numbers, eight bytes on flash.
+@value
+struct Settings
+    boots: Int
+    rate_hz: Int
+
+// A record is written as it is: the trait answers its eight bytes.
+impl ByteSrc for Settings
+    fn src_len(self) -> Int
+        8
+
+    fn src_at(self, i: Int) -> Int
+        if i < 4
+            (self.boots >>> (8 * i)) & 255
+        else
+            (self.rate_hz >>> (8 * (i - 4))) & 255
+
+// The 32-bit little-endian number at `off` in `b`.
+fn u32_at(var b: Buf, off: Int) -> Int
+    b[off] as Int | (b[off + 1] as Int << 8) | (b[off + 2] as Int << 16)
+        | (b[off + 3] as Int << 24)
+
+// Prints the record after `what`.
+fn show(what: Str, s: Settings) [hw]
+    hal.uart.write(what)
+    hal.uart.write("boots=")
+    hal.uart.write(str.from_int(s.boots))
+    hal.uart.write(" rate=")
+    hal.uart.write(str.from_int(s.rate_hz))
+    hal.uart.write("\n")
+
+fn main() [hw, mutate, time]
+    bsp.board.init()
+    // The data region, formatted when it holds no filesystem.
+    let vol = nvfs.mount_with(nvfs.region_flash(), nvfs.default_config(), true)
+    if vol.status() != EOk
+        hal.uart.write("settings: mount failed: ")
+        hal.uart.write(nvfs.err_str(vol.status()))
+        hal.uart.write("\n")
+        return
+    hal.uart.write("settings: mounted\n")
+
+    // The record from the last boot, or the defaults on the first.
+    var s = Settings { boots: 0, rate_hz: 100 }
+    var buf: Buf = Vec.new()
+    if vol.file_read_at("/settings", 0, 8, buf) == EOk and buf.len() == 8
+        s = Settings { boots: u32_at(buf, 0), rate_hz: u32_at(buf, 4) }
+
+    // One more boot, written as one commit.
+    s = Settings { boots: s.boots + 1, rate_hz: s.rate_hz }
+    if vol.file_write("/settings", s) != EOk
+        hal.uart.write("settings: write failed\n")
+        return
+    show("settings: ", s)
+
+    // The bytes the flash now holds.
+    if vol.file_read_at("/settings", 0, 8, buf) == EOk
+        show("settings: read back ", Settings { boots: u32_at(buf, 0), rate_hz: u32_at(buf, 4) })
+    loop
+        core.rt.sleep_ms(1000)

@@ -1,0 +1,80 @@
+// examples/config.nv — a configuration file read from a volume the host
+// built and the probe wrote into the board's data region.
+//
+// On the host, a folder with the file, an image of it for the board's
+// data region, and the image written into the region:
+//
+//   mkdir -p files/etc
+//   printf 'rate=250\n' > files/etc/config
+//   novofs mk files -o files.bin --target=nrf52832-dk
+//   novo flash --target=nrf52832-dk --data files.bin
+//
+// Then the program:
+//
+//   novo build --target=nrf52832-dk examples/config.nv
+//   novo flash --target=nrf52832-dk config.elf
+//
+// It mounts the region without formatting it, so a region with no
+// volume is reported rather than formatted over, reads `/etc/config`,
+// and takes the number after `rate=`.  It prints, over the board's
+// console:
+//
+//   config: /etc/config holds 9 bytes
+//   config: rate=250
+//   config: rate is 250
+
+use nvfs
+
+// The number after `rate=` in the first `len` bytes of `b`; -1 when
+// there is none.
+fn rate_of(var b: Buf, len: Int) -> Int
+    let key = "rate="
+    for at in 0..len
+        var hit = at + 5 <= len
+        for k in 0..5
+            if hit and (b[at + k] as Int) != str.byte_at_or(key, k, 0)
+                hit = false
+        if hit
+            var n = 0
+            var digits = 0
+            for i in at + 5..len
+                let c = b[i] as Int
+                if c < 48 or c > 57
+                    break
+                n = n * 10 + (c - 48)
+                digits = digits + 1
+            if digits > 0
+                return n
+    0 - 1
+
+fn main() [hw, mutate, time]
+    bsp.board.init()
+    let vol = nvfs.mount(nvfs.region_flash())
+    if vol.status() != EOk
+        hal.uart.write("config: no volume in the data region: ")
+        hal.uart.write(nvfs.err_str(vol.status()))
+        hal.uart.write("\n")
+        return
+    let size = vol.file_size("/etc/config")
+    if size < 0
+        hal.uart.write("config: no /etc/config\n")
+        return
+    hal.uart.write("config: /etc/config holds ")
+    hal.uart.write(str.from_int(size))
+    hal.uart.write(" bytes\n")
+    var buf: Buf = Vec.new()
+    var len = size
+    if len > BUF_CAP
+        len = BUF_CAP
+    if vol.file_read_at("/etc/config", 0, len, buf) != EOk
+        hal.uart.write("config: read failed\n")
+        return
+    // The file's text, as it is.
+    hal.uart.write("config: ")
+    for i in 0..len
+        hal.uart.write_byte(buf[i] as Int)
+    hal.uart.write("config: rate is ")
+    hal.uart.write(str.from_int(rate_of(buf, len)))
+    hal.uart.write("\n")
+    loop
+        core.rt.sleep_ms(1000)

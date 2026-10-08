@@ -1,0 +1,88 @@
+// A program that names `nvfs` and nothing else of the package: a device
+// of its own behind the `Flash` trait, and a write and a listing through
+// the `FileSystem` trait, which the volume implements.
+
+use std.list
+use std.test
+
+use nvfs
+
+// Cells of the suite's device, one module-level list.
+var cells: [Int] = []
+
+// A RAM device of `count` blocks of 512 bytes, programmed in 16-byte
+// pages, that only clears bits on a prog.
+struct Mem
+    count: Int
+
+fn mem(count: Int) -> Mem [mutate]
+    cells = list.map(list.range(0, count * 512), i => 255)
+    Mem { count: count }
+
+impl Flash[mutate] for Mem
+    fn read_size(self) -> Int
+        16
+
+    fn prog_size(self) -> Int
+        16
+
+    fn block_size(self) -> Int
+        512
+
+    fn block_count(self) -> Int
+        self.count
+
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [mutate]
+        dst.clear()
+        if block < 0 or block >= self.count or off + len > 512
+            return false
+        for i in 0..len
+            let _ = dst.push(cells[block * 512 + off + i] as u8)
+        true
+
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [mutate]
+        if block < 0 or block >= self.count or off + src.len() > 512
+            return false
+        for i in 0..src.len()
+            cells[block * 512 + off + i] = cells[block * 512 + off + i] & src[i] as Int
+        true
+
+    fn erase(self, block: Int) -> Bool [mutate]
+        if block < 0 or block >= self.count
+            return false
+        for i in 0..512
+            cells[block * 512 + i] = 255
+        true
+
+    fn sync(self) -> Bool
+        true
+
+// Writes a log line and answers how many entries the root holds, on any
+// filesystem.
+fn log_and_count<F: FileSystem[e]>(fsys: F) -> Int [e]
+    let _ = fsys.mkdir("/logs")
+    let _ = fsys.file_write("/logs/boot", "booted")
+    let _ = fsys.file_append("/logs/boot", " again")
+    var n = 0
+    var at = fsys.list("/")
+    while true
+        match fsys.list_next(at)
+            Some(en) =>
+                n = n + 1
+            None     =>
+                break
+    n
+
+@test
+fn test_a_volume_behind_the_filesystem_trait() [mutate]
+    let dev = mem(16)
+    test.assert_eq_str(nvfs.err_str(nvfs.format(dev, nvfs.default_config())), "ok")
+    let vol = nvfs.mount(dev)
+    test.assert_eq(log_and_count(vol), 1)
+    test.assert_eq(vol.file_size("/logs/boot"), 12)
+    var buf: Buf = Vec.new()
+    test.assert_eq_str(nvfs.err_str(vol.file_read_at("/logs/boot", 0, 6, buf)), "ok")
+    test.assert_eq(buf[0] as Int, 98)
+    match vol.stat("/logs/boot")
+        EntOk(en) => test.assert_eq_str(en.name_str(), "boot")
+        EntErr(e) => test.fail(nvfs.err_str(e))

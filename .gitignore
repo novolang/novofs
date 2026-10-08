@@ -1,25 +1,17 @@
 # Build outputs.
 _novo/
 
-# The generated API page.  `novo doc` writes it here so you can read
-# what the registry will serve; the registry gets its own copy, uploaded
-# beside the archive by `novo pkg publish`.  It is generated from the
-# sources, so committing it would be committing a second original.
+# The generated API page.  `novo doc` writes it here; the registry gets
+# its own copy, uploaded beside the archive by `novo pkg publish`.
 APIDOC.md
 
-# The built package binary, the image tool — `novo pkg build` names it
-# after the package.
-/novofs
-
-# What `novo build --target=<board>` leaves beside an example.
+# Images a build of an example for a board writes beside it, and the
+# block file QEMU's MPS2 machines keep a volume in.
 *.elf
 *.hex
 *.bin
 *.map
+novo_block.img
 
-# NOT novo.lock.  A locked build resolves the same closure twice and
-# does it offline once the cache is warm, and a consumer never reads a
-# dependency's lock — they resolve their own closure and write their
-# own — so committing it costs nobody anything and makes this
-# repository's CI reproducible.  It is not on the publish allow-list, so
-# it never ships either way.
+# NOT novo.lock: a locked build resolves the same closure twice, and a
+# consumer never reads a dependency's lock.

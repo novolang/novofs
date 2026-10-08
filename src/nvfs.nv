@@ -1,9 +1,14 @@
-// src/nvfs.nv — the filesystem core: config, errors,
-// superblock, directory tree, files.
+// src/nvfs.nv — the novofs filesystem: the storage trait a volume sits
+// on, the configuration, the mounted volume and its operations, and the
+// device over a board's reserved flash region.
 //
-// Byte-level pair mechanics (the read cache, the program buffer,
-// scanning, record framing) live in meta.nv.  This module gives
-// records their MEANING:
+// This module is the package's whole public surface.  A program writes
+// `use nvfs` and nothing else: it mounts a device that implements
+// `Flash`, gets a `Volume`, and calls the volume's operations, which
+// take a path.  `nv` holds the metadata-pair mechanics underneath
+// and is internal to the package.
+//
+// The records this module gives meaning to:
 //
 //   0x01 REC_SUPERBLOCK  magic+version+geometry (+name/inline/file max)
 //   0x02 REC_DIRENT      kind u8 | name_len u8 | name | pair0 u32 | pair1 u32
@@ -12,51 +17,705 @@
 //   0x04 REC_RENAME      old_len u8 | old | new_len u8 | new
 //   0xFF reserved forever (erased flash)
 //
-// Design invariant: EVERY filesystem mutation is exactly one
-// self-CRC'd record (rename included — it is one record, not
-// tombstone+dirent), so per-record commit atomicity is the whole
-// crash-consistency story.  A directory's live state is the fold of
-// its active block's records in log order: a dirent upserts, a
-// tombstone removes, a rename moves.
+// Every filesystem mutation is exactly one record that carries its own
+// CRC-32C, a rename included, so the atomicity of one record's commit is
+// the whole crash-consistency rule.  A directory's live state is the
+// fold of its active block's records in log order: a dirent adds or
+// replaces a name, a tombstone removes it, a rename moves it.
 //
 // The fold is never built.  A name is resolved by finding the last
 // record in the log that touches it (`resolve`), and a directory is
 // listed by walking the log once and keeping each entry no later
-// record removes (`dir_next`).  Both read the flash through meta.nv's
-// cache and hold nothing but offsets, so the core runs in fixed memory
-// on a device: the two meta.nv buffers, the allocator's bitmap, and
-// the frames of the call in progress.
+// record removes (`dir_next`).  Both read the flash through nv's
+// cache and hold nothing but offsets, so the filesystem runs in fixed
+// memory on a device: the two nv buffers, the allocator's bitmap,
+// and the frames of the call in progress.
 //
-// Directories: each directory is its own metadata pair; the root
-// directory shares the superblock pair (blocks 0+1), as littlefs does.
-// A parent's dirent record carries the child's pair block numbers.
-// mkdir initialises the child pair BEFORE the parent dirent commits,
-// so a crash in between leaves the child blocks unreachable — and the
-// allocator reclaims them by construction, because "free" is defined
-// as "not reached by a walk from the root" rather than tracked in a
-// list that a crash could leave stale.
+// Each directory is its own metadata pair, and the root directory
+// shares the superblock pair (blocks 0 and 1), as in littlefs.  A
+// parent's dirent record carries the child's pair block numbers.  mkdir
+// initialises the child pair before the parent dirent commits, so a cut
+// in between leaves the child blocks unreachable, and the allocator
+// reclaims them, because a free block is one a walk from the root does
+// not reach.
 //
-// Compaction folds the live state (superblock record + live dirents)
-// into the sibling block with revision+1; when an append does not fit,
-// the new operation rides INSIDE that compaction (one seal covers
-// both), keeping the one-record atomicity story.
+// Compaction folds the live state (the superblock record and the live
+// dirents) into the sibling block with the revision plus one.  When an
+// append does not fit, the new operation rides inside that compaction,
+// so one seal covers both.
 //
-// Allocator: a reachability walk from the root marks which blocks in a
-// window of LA_BITS blocks are live, and a rotating cursor picks free
-// ones from there.  The walk is the correctness half — it can never
-// hand out a live block — and the cursor is only a wear policy, so
-// changing the pick order can never corrupt a volume.
+// The allocator walks every block reachable from the root and marks
+// the live ones in a window of LA_BITS blocks, and a rotating cursor
+// picks free ones from there.  The walk is what keeps a live block from
+// being handed out; the cursor only spreads the wear.
 //
 // Effects: every function that touches the device is generic over
-// `D: Flash[e]` and declares `[mutate, e]`.  The core names no effect
-// of hardware, files or foreign functions; the device supplies them.
+// `D: Flash[e]` and declares `[mutate, e]`, so a caller is charged the
+// effects of the device it passes and nothing else.
 //
-// Deferred (documented): u32 revision wraparound; cross-directory
-// rename (needs littlefs-style global move state — same-directory
-// rename ships, cross-directory answers ENotSupported).
+// Not handled: u32 revision wraparound, and a rename across
+// directories, which needs littlefs-style global move state and answers
+// ENotSupported.
 
-use flash
-use meta
+use std.bytes
+
+use crc
+
+// ── Storage: the Flash trait ────────────────────────────────────────
+
+// The largest transfer one `read` or `prog` moves, 512 bytes.  A
+// device's read and prog sizes are at most this, and one metadata
+// record, header and checksum included, fits in it.
+pub const BUF_CAP: Int = 512
+
+// The buffer bytes move through: at most 512 bytes the caller owns and
+// passes by address.  `read` replaces its contents with the bytes it
+// read, and `prog` programs every byte it holds, so neither side of the
+// call allocates.
+//
+// ```novo
+// var buf: Buf = Vec.new()
+// let _ = buf.push(0x4e)
+// println("${buf.len()}")   // 1
+// ```
+pub alias Buf = Vec[u8; 512]
+
+// The storage a volume sits on: NOR-class flash that programs in small
+// pages and erases in large blocks.
+//
+// An implementation keeps this contract.  `erase(b)` sets every byte
+// of block `b` to 0xFF.  `prog` only clears bits.  Offsets and lengths
+// are whole read or prog units and lie inside one block, and a call
+// that breaks this answers false and does nothing.  The geometry is
+// constant for the device's lifetime.  Each implementation supplies the
+// effects its storage costs: the board's region is `impl Flash[hw]`, a
+// RAM device `impl Flash[mutate]`.
+pub trait Flash[e]
+    // The unit a read moves, in bytes.
+    fn read_size(self) -> Int [e]
+    // The unit a prog moves, in bytes.
+    fn prog_size(self) -> Int [e]
+    // The bytes one erase clears.
+    fn block_size(self) -> Int [e]
+    // The number of blocks.
+    fn block_count(self) -> Int [e]
+    // Replaces `dst`'s contents with the `len` bytes at (block, off).
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [e]
+    // Programs every byte `src` holds at (block, off); `src` is the
+    // caller's buffer, passed by address and left as it was.
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [e]
+    // Sets every byte of `block` to 0xFF.
+    fn erase(self, block: Int) -> Bool [e]
+    // Makes every prog and erase so far durable.
+    fn sync(self) -> Bool [e]
+
+// ── Sources: what a file is written from ────────────────────────────
+
+// The bytes a file write takes: `src_len` of them, the byte at index
+// `i` answered by `src_at`.  The volume reads a source once, front to
+// back, while it programs the file.
+//
+// A string literal and a list of bytes are sources already, so a write
+// of either is one line.  A record of the program's own, such as a
+// `@value` struct, implements the trait to be written as it is.
+//
+// ```novo
+// @value
+// struct Reading
+//     millivolts: Int
+//
+// impl ByteSrc for Reading
+//     fn src_len(self) -> Int
+//         2
+//     fn src_at(self, i: Int) -> Int
+//         (self.millivolts >>> (8 * i)) & 255
+//
+// println("${Reading { millivolts: 3300 }.src_at(0)}")   // 228
+// ```
+pub trait ByteSrc
+    // How many bytes the source holds.
+    fn src_len(self) -> Int
+    // The byte at index `i`, 0 to 255.
+    fn src_at(self, i: Int) -> Int
+
+// A buffer as a source: the bytes it holds, up to 512 of them, inline
+// in the caller's frame.  This is the inline byte array of a device
+// program, which keeps no list.
+impl ByteSrc for Buf
+    @tier(embedded)
+    fn src_len(self) -> Int
+        self.len()
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int
+        self[i] as Int
+
+// A string as a source: its bytes, without a terminator.
+impl ByteSrc for Str
+    @tier(embedded)
+    fn src_len(self) -> Int
+        str.len(self)
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int
+        str.byte_at_or(self, i, 0)
+
+// A list of bytes as a source, such as a `const` declared `[u8; N]`.
+impl ByteSrc for [u8]
+    @tier(embedded)
+    fn src_len(self) -> Int
+        self.len()
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int
+        self[i] as Int
+
+// A source of no bytes.
+pub @value
+struct NoSrc
+    none: u8
+
+impl ByteSrc for NoSrc
+    @tier(embedded)
+    fn src_len(self) -> Int
+        0
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int
+        0
+
+// A source of no bytes, for a write that creates an empty file.
+//
+// ```novo
+// println("${nvfs.no_src().src_len()}")   // 0
+// ```
+pub @tier(embedded)
+fn no_src() -> NoSrc
+    NoSrc { none: 0 }
+
+// ── Metadata pairs: the byte-level mechanics ─────────────────────────
+//
+// A metadata pair is two erase blocks holding an append-only record
+// log; the block with the higher sealed revision is active.  This
+// module owns the byte-level mechanics: the read cache and the program
+// buffer every other module reads and writes flash through, scanning a
+// block's log, walking its records, and writing a record or a sealed
+// revision word.  What the records MEAN (superblock, directory
+// entries) is the business of the sections after this one.
+//
+// Block layout (see README.md "On-flash format history" for why the
+// records are padded away from the revision word):
+//
+//   [ revision u32 | pad-to-meta_off | records ... | 0xFF free ]
+//   meta_off = max(4, prog_size)
+//   record   = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ]
+//
+// Each record is padded with 0xFF to a prog_size multiple.  A
+// COMPACTION writes every record first and programs the revision word
+// LAST: a power cut mid-compaction leaves the sibling's revision word
+// erased (0xFFFFFFFF, invalid), and the old block keeps winning.  Once
+// the revision word programs, the sibling is complete by construction.
+// A partially programmed revision word reads as some value, but the
+// records behind it are already complete, so either arbitration
+// outcome is a consistent state.
+//
+// A torn APPEND (a bad CRC or a truncated header mid-log) ends the
+// block's valid log AND marks the block full: the garbage tail cannot
+// be programmed again reliably (NOR prog only clears bits), so the
+// next append goes through a compaction to the sibling.
+//
+// Memory: two buffers of BUF_CAP bytes in static storage, the
+// read cache and the program buffer, and a handful of integers.  They
+// are module state because one filesystem operation runs at a time.
+// What they hold belongs to one mounted volume, the owner, which owns
+// its device: no write reaches that device except through the
+// filesystem, so the read cache and the kept scans stay true from one
+// operation of the volume to the next.  An operation of another volume
+// takes them over and drops them first (`claim`), and a mount or a
+// format drops them, so a second device is never answered from another
+// device's bytes.
+
+let REV_ERASED = 0xFFFFFFFF
+
+// ── The read cache ──────────────────────────────────────────────────
+//
+// One window of one block.  A read outside it loads the read_size-
+// aligned window that starts at or below the offset.  A prog or an
+// erase of the cached block drops it.
+
+var rc: Buf = Vec.new()
+var rc_blk  = -1
+var rc_off  = 0
+
+// The last two scans, by block.  A scan reads its block's whole log and
+// checks every record's CRC, and one operation scans the same pair
+// several times: to walk to a directory, to find a name, to commit.  The
+// scans are kept by the read cache's rules: forgotten for a block before
+// the block is programmed or erased, so a scan is never answered from a
+// block that changed after it, and dropped with the read cache when
+// another volume claims the state.  A writer that knows what it
+// programmed, an append of one record or a compaction, files the scan
+// the block now has (`scan_note`), which is what a scan of it would
+// answer.
+var meta_sm_blk0 = -1
+var meta_sm_blk1 = -1
+var meta_sm_next = 0
+var meta_sm_res0 = MetaScan { valid: false, torn: false, rev: 0, end_off: 0, limit: 0 }
+var meta_sm_res1 = MetaScan { valid: false, torn: false, rev: 0, end_off: 0, limit: 0 }
+
+// The volume whose read cache and scans these are; -1 for none.
+var meta_owner = -1
+
+@tier(embedded)
+fn cache_drop() [mutate]
+    rc_blk = -1
+    meta_sm_blk0 = -1
+    meta_sm_blk1 = -1
+    meta_owner = -1
+
+// Makes volume `id` the owner of the read cache and the scans, keeping
+// them when it owns them already.  Answers whether it did not, in
+// which case they were dropped.
+@tier(embedded)
+fn claim(id: Int) -> Bool [mutate]
+    if meta_owner == id
+        return false
+    cache_drop()
+    meta_owner = id
+    true
+
+// Makes volume `id` the owner of what the read cache and the scans hold
+// now: a mount's, which read the device the volume takes.
+@tier(embedded)
+fn adopt(id: Int) [mutate]
+    meta_owner = id
+
+// Gives up volume `id`'s claim, dropping what it held.  Answers whether
+// it held one.
+@tier(embedded)
+fn release(id: Int) -> Bool [mutate]
+    if meta_owner != id
+        return false
+    cache_drop()
+    true
+
+// Files `r` as the scan of `blk`: the scan a writer knows the block has
+// after it programmed the block, which `scan_block` would answer.
+@tier(embedded)
+fn scan_note(blk: Int, r: MetaScan) [mutate]
+    if meta_sm_blk0 == blk
+        meta_sm_res0 = r
+    else if meta_sm_blk1 == blk
+        meta_sm_res1 = r
+    else
+        scan_keep(blk, r)
+
+// Keeps `r` as the scan of `blk` in a free place, or in place of the
+// older of the two.  A place a forgotten block left is free: a writer
+// forgets the block it programs and files its new scan afterwards, and
+// filing it over the other block's scan would make the next operation
+// on the pair read that block's whole log again.
+@tier(embedded)
+fn scan_keep(blk: Int, r: MetaScan) [mutate]
+    if meta_sm_blk0 < 0
+        meta_sm_blk0 = blk
+        meta_sm_res0 = r
+        meta_sm_next = 1
+    else if meta_sm_blk1 < 0
+        meta_sm_blk1 = blk
+        meta_sm_res1 = r
+        meta_sm_next = 0
+    else if meta_sm_next == 0
+        meta_sm_blk0 = blk
+        meta_sm_res0 = r
+        meta_sm_next = 1
+    else
+        meta_sm_blk1 = blk
+        meta_sm_res1 = r
+        meta_sm_next = 0
+
+@tier(embedded)
+fn cache_forget(blk: Int) [mutate]
+    if rc_blk == blk
+        rc_blk = -1
+    if meta_sm_blk0 == blk
+        meta_sm_blk0 = -1
+    if meta_sm_blk1 == blk
+        meta_sm_blk1 = -1
+
+// The byte at (blk, off), or -1 when it cannot be read.  A miss loads
+// the window of up to `cap` bytes, whole read units, that starts at or
+// below the offset.
+@tier(embedded)
+fn rd_win<D: Flash[e]>(dev: D, blk: Int, off: Int, cap: Int) -> Int [mutate, e]
+    if blk == rc_blk and off >= rc_off and off < rc_off + rc.len()
+        return rc[off - rc_off] as Int
+    let bs = dev.block_size()
+    let rs = dev.read_size()
+    if off < 0 or off >= bs or rs < 1 or rs > BUF_CAP
+        return -1
+    let start = off - off % rs
+    var win = cap - cap % rs
+    if win < rs
+        win = rs
+    if start + win > bs
+        win = bs - start
+    if not dev.read(blk, start, win, rc)
+        rc_blk = -1
+        return -1
+    rc_blk = blk
+    rc_off = start
+    rc[off - start] as Int
+
+// The byte at (blk, off) for a reader of a run of bytes: a miss loads a
+// whole cache's worth.
+@tier(embedded)
+fn rd8<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    rd_win(dev, blk, off, BUF_CAP)
+
+// A header walk reads a few bytes of each record, so a miss there
+// loads a short window, PEEK_BYTES rounded to whole read units, rather
+// than a whole cache's worth: a record of a few hundred bytes would
+// otherwise cost a full window load for its header alone.  The name
+// and the fields after a header are in the same short window.
+let PEEK_BYTES = 32
+
+@tier(embedded)
+fn rd16<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    let a = rd8(dev, blk, off)
+    let b = rd8(dev, blk, off + 1)
+    if a < 0 or b < 0
+        -1
+    else
+        a + b * 256
+
+// A little-endian u32, or -1 when it cannot be read.
+@tier(embedded)
+fn rd32<D: Flash[e]>(dev: D, blk: Int, off: Int) -> Int [mutate, e]
+    let a = rd8(dev, blk, off)
+    let b = rd8(dev, blk, off + 1)
+    let c = rd8(dev, blk, off + 2)
+    let d = rd8(dev, blk, off + 3)
+    if a < 0 or b < 0 or c < 0 or d < 0
+        -1
+    else
+        a + b * 256 + c * 65536 + d * 16777216
+
+// CRC-32C over blk[lo, hi), or -1 when a byte cannot be read.
+@tier(embedded)
+fn crc_range<D: Flash[e]>(dev: D, blk: Int, lo: Int, hi: Int) -> Int [mutate, e]
+    var c = 0xFFFFFFFF
+    var i = lo
+    // A read-cache window at a time: `rd8` loads the window holding
+    // byte `i`, and the bytes of it up to `hi` go through the CRC from
+    // the cache itself.
+    for step in 0..hi - lo + 1
+        if i >= hi
+            break
+        if rd8(dev, blk, i) < 0
+            return -1
+        var end = rc_off + rc.len()
+        if end > hi
+            end = hi
+        for k in i - rc_off..end - rc_off
+            c = crc.crc32c_step(c, rc[k] as Int)
+        i = end
+    c ^ 0xFFFFFFFF
+
+// ── The program buffer ──────────────────────────────────────────────
+//
+// Bytes written at (pb_blk, pb_off) onward collect here and are
+// programmed a chunk at a time: the largest prog_size multiple that
+// fits BUF_CAP.  A writer starts at a prog_size-aligned offset and pads
+// to one before it finishes, so every prog is aligned.  A failed prog
+// makes every later put a no-op and `wr_finish` answer false.
+
+var pb: Buf  = Vec.new()
+var pb_blk   = -1
+var pb_off   = 0
+var pb_chunk = 16
+var pb_ps    = 16
+var pb_fail  = false
+var wcrc     = 0
+// The offset just past the last record a writer closed: its checksum,
+// before the padding.
+var rec_last = 0
+
+@tier(embedded)
+fn wr_begin<D: Flash[e]>(dev: D, blk: Int, off: Int) [mutate, e]
+    let ps = dev.prog_size()
+    pb.clear()
+    pb_blk = blk
+    pb_off = off
+    pb_ps = ps
+    pb_chunk = BUF_CAP - BUF_CAP % ps
+    pb_fail = false
+
+@tier(embedded)
+fn wr_flush<D: Flash[e]>(dev: D) [mutate, e]
+    if pb.len() > 0
+        if not pb_fail
+            cache_forget(pb_blk)
+            if not dev.prog(pb_blk, pb_off, pb)
+                pb_fail = true
+        pb_off = pb_off + pb.len()
+        pb.clear()
+
+@tier(embedded)
+fn wr_put<D: Flash[e]>(dev: D, b: Int) [mutate, e]
+    if pb.len() >= pb_chunk
+        wr_flush(dev)
+    let _ = pb.push((b & 255) as u8)
+
+@tier(embedded)
+fn wr_put32<D: Flash[e]>(dev: D, v: Int) [mutate, e]
+    wr_put(dev, v & 255)
+    wr_put(dev, (v >>> 8) & 255)
+    wr_put(dev, (v >>> 16) & 255)
+    wr_put(dev, (v >>> 24) & 255)
+
+// The offset the next put lands at.
+@tier(embedded)
+fn wr_pos() -> Int [mutate]
+    pb_off + pb.len()
+
+// The offset just past the last record closed since `rec_reset`.
+@tier(embedded)
+fn rec_end() -> Int [mutate]
+    rec_last
+
+@tier(embedded)
+fn rec_reset(off: Int) [mutate]
+    rec_last = off
+
+// The scan of a block whose log ends at `limit` with nothing torn, as a
+// writer that just programmed it knows it.
+@tier(embedded)
+fn scan_of(rev: Int, limit: Int, ps: Int) -> MetaScan
+    MetaScan { valid: true, torn: false, rev: rev as u32, end_off: align_up(limit, ps) as u32,
+               limit: limit as u32 }
+
+// Pads with 0xFF (indistinguishable from free space on the next scan)
+// to the next prog_size boundary.
+@tier(embedded)
+fn wr_pad<D: Flash[e]>(dev: D) [mutate, e]
+    for i in 0..pb_ps
+        if wr_pos() % pb_ps == 0
+            break
+        wr_put(dev, 255)
+
+// Programs what is left; answers whether every prog succeeded.
+@tier(embedded)
+fn wr_finish<D: Flash[e]>(dev: D) -> Bool [mutate, e]
+    wr_flush(dev)
+    not pb_fail
+
+// ── Records ─────────────────────────────────────────────────────────
+
+@tier(embedded)
+fn align_up(n: Int, ps: Int) -> Int
+    let rem = n % ps
+    if rem == 0
+        n
+    else
+        n + (ps - rem)
+
+// The bytes a record with a `len`-byte payload takes on flash.
+@tier(embedded)
+fn rec_size(len: Int, ps: Int) -> Int
+    align_up(4 + len + 4, ps)
+
+@tier(embedded)
+fn meta_off<D: Flash[e]>(dev: D) -> Int [e]
+    let ps = dev.prog_size()
+    if ps > 4
+        ps
+    else
+        4
+
+// Opens a record: the header, into the CRC.
+@tier(embedded)
+fn rec_head<D: Flash[e]>(dev: D, rtype: Int, len: Int) [mutate, e]
+    wcrc = 0xFFFFFFFF
+    rec_byte(dev, rtype & 255)
+    rec_byte(dev, 0)
+    rec_byte(dev, len & 255)
+    rec_byte(dev, (len >>> 8) & 255)
+
+// One payload byte, into the CRC.
+@tier(embedded)
+fn rec_byte<D: Flash[e]>(dev: D, b: Int) [mutate, e]
+    wcrc = crc.crc32c_step(wcrc, b & 255)
+    wr_put(dev, b)
+
+@tier(embedded)
+fn rec_u32<D: Flash[e]>(dev: D, v: Int) [mutate, e]
+    rec_byte(dev, v & 255)
+    rec_byte(dev, (v >>> 8) & 255)
+    rec_byte(dev, (v >>> 16) & 255)
+    rec_byte(dev, (v >>> 24) & 255)
+
+// Closes a record: the CRC, then the padding.
+@tier(embedded)
+fn rec_tail<D: Flash[e]>(dev: D) [mutate, e]
+    wr_put32(dev, wcrc ^ 0xFFFFFFFF)
+    rec_last = wr_pos()
+    wr_pad(dev)
+
+// Programs the revision word of `blk` — the seal of a compaction — on
+// its own prog page, and syncs.
+@tier(embedded)
+fn seal<D: Flash[e]>(dev: D, blk: Int, rev: Int) -> Bool [mutate, e]
+    wr_begin(dev, blk, 0)
+    wr_put32(dev, rev)
+    wr_pad(dev)
+    if wr_finish(dev)
+        dev.sync()
+    else
+        false
+
+// ── Scanning ────────────────────────────────────────────────────────
+
+// One block's scan result.
+//   valid   — the revision word is sealed (the block takes part in
+//             arbitration)
+//   torn    — the log ends in garbage; the block is append-full
+//   end_off — the first free byte for an append (prog_size-aligned);
+//             block_size if torn
+//   limit   — the end of the last valid record: the records worth
+//             reading lie in [meta_off, limit)
+@value
+struct MetaScan
+    valid: Bool
+    torn: Bool
+    rev: u32
+    end_off: u32
+    limit: u32
+
+// The scan of `blk`, from the two kept when one of them is its.
+@tier(embedded)
+fn scan<D: Flash[e]>(dev: D, blk: Int) -> MetaScan [mutate, e]
+    if blk >= 0 and blk == meta_sm_blk0
+        return meta_sm_res0
+    if blk >= 0 and blk == meta_sm_blk1
+        return meta_sm_res1
+    let r = scan_block(dev, blk)
+    scan_keep(blk, r)
+    r
+
+@tier(embedded)
+fn scan_block<D: Flash[e]>(dev: D, blk: Int) -> MetaScan [mutate, e]
+    let bs = dev.block_size()
+    let ps = dev.prog_size()
+    let rev = rd32(dev, blk, 0)
+    if rev < 0
+        return MetaScan { valid: false, rev: 0, torn: true, end_off: bs as u32, limit: 0 }
+    if rev == REV_ERASED
+        return MetaScan { valid: false, rev: 0, torn: false, end_off: bs as u32, limit: 0 }
+    let m0 = meta_off(dev)
+    var off = m0
+    var torn = false
+    var last_end = m0
+    // Every pass advances `off` by at least one byte.
+    for step in 0..bs
+        if off + 4 > bs
+            break
+        let t = rd8(dev, blk, off)
+        if t < 0
+            torn = true
+            break
+        if t == 255
+            // Padding or free space.  Padding is shorter than a page,
+            // so a run of BUF_CAP erased bytes is the free space at the
+            // end of the log, and nothing past it was ever programmed:
+            // an append programs from the log's end, a prog moves at
+            // most BUF_CAP bytes, and a prog cut short leaves a prefix
+            // of its bytes, so a torn append begins inside that run.
+            let bound = if off + BUF_CAP < bs
+                off + BUF_CAP
+            else
+                bs
+            off = skip_erased(dev, blk, off, bound)
+            if off >= bound
+                break
+        else
+            let len = rd16(dev, blk, off + 2)
+            if len < 0 or off + 4 + len + 4 > bs
+                torn = true
+                break
+            let stored = rd32(dev, blk, off + 4 + len)
+            if stored < 0 or stored != crc_range(dev, blk, off, off + 4 + len)
+                torn = true
+                break
+            off = off + 4 + len + 4
+            last_end = off
+    if torn
+        MetaScan { valid: true,
+            rev: rev as u32,
+            torn: true,
+            end_off: bs as u32,
+            limit: last_end as u32 }
+    else
+        MetaScan { valid: true, rev: rev as u32, torn: false, end_off: align_up(last_end, ps) as u32,
+                   limit: last_end as u32 }
+
+// The first offset at or after `off`, below `bs`, whose byte does not
+// read 0xFF, or `bs` when every byte up to it does.  The bytes are
+// searched in the read cache's window, one window at a time, rather
+// than with a call per byte.  An offset whose byte cannot be read is
+// answered as it is, for the caller's own read to fail on.
+@tier(embedded)
+fn skip_erased<D: Flash[e]>(dev: D, blk: Int, off: Int, bs: Int) -> Int [mutate, e]
+    var o = off
+    for step in 0..bs
+        if o >= bs
+            break
+        if rd8(dev, blk, o) < 0
+            return o
+        for k in o - rc_off..rc.len()
+            if (rc[k] as Int) != 255
+                return rc_off + k
+        o = rc_off + rc.len()
+    bs
+
+// A record found by `rec_at`: its offset, type, payload length, and
+// the offset just past it.  Its payload starts at off + 4.
+@value
+struct RecAt
+    ok: Bool
+    rtype: u8
+    len: u16
+    off: u32
+    next: u32
+
+// The first record at or after `off` and before `limit`.  Records
+// below a scan's limit were CRC-checked by the scan, so this reads only
+// their headers, in short windows.
+@tier(embedded)
+fn rec_at<D: Flash[e]>(dev: D, blk: Int, off: Int, limit: Int) -> RecAt [mutate, e]
+    var o = off
+    for step in 0..limit - off + 1
+        if o >= limit
+            break
+        let t = rd_win(dev, blk, o, PEEK_BYTES)
+        if t < 0
+            break
+        if t != 255
+            let lo = rd_win(dev, blk, o + 2, PEEK_BYTES)
+            let hi = rd_win(dev, blk, o + 3, PEEK_BYTES)
+            let len = if lo < 0 or hi < 0
+                -1
+            else
+                lo + hi * 256
+            if len < 0
+                break
+            return RecAt { ok: true,
+                off: o as u32,
+                rtype: t as u8,
+                len: len as u16,
+                next: (o + 4 + len + 4) as u32 }
+        o = o + 1
+    RecAt { ok: false, off: limit as u32, rtype: 0, len: 0, next: limit as u32 }
 
 let MAGIC0           = 0x4E   // 'N'
 let MAGIC1           = 0x56   // 'V'
@@ -76,12 +735,18 @@ let CTZ_NONE         = 4294967295   // 0xFFFFFFFF — absent skip pointer (reads
 // Directory nesting a walk follows before it calls the tree corrupt.
 let DEPTH_MAX = 32
 
-// A name, copied off a path or off the flash.  name_max is at most 255.
-alias NameBuf = Vec[u8; 256]
+// The bytes of a name, at most 255 of them: an entry's name, or one
+// copied off a path.
+//
+// ```novo
+// var name: NameBuf = Vec.new()
+// println("${name.len()}")   // 0
+// ```
+pub alias NameBuf = Vec[u8; 256]
 
 // The inline data of the record an operation commits: a file's bytes
 // when they fit its directory record, and nothing for every other
-// record.  It is module state, as meta.nv's two buffers are, because one
+// record.  It is module state, as nv's two buffers are, because one
 // filesystem operation runs at a time and an operation needs it only
 // until its commit returns; a local would put 520 bytes in the frame of
 // every operation that commits, which on a device is stack a task may
@@ -90,7 +755,12 @@ var nvfs_stage: Buf = Vec.new()
 
 // ── Config ──────────────────────────────────────────────────────────
 
-@value
+// The choices a volume is formatted with, beside the device's geometry:
+// how many compactions a metadata pair takes before it moves
+// (`block_cycles`, -1 for never), the read and prog cache and the
+// allocator's window in bytes, and the longest name, the largest file
+// and the largest file kept inside its directory record, in bytes.
+pub @value
 struct FsConfig
     block_cycles: Int   // erases before a metadata pair relocates (wear); -1 disables
     cache_size: Int   // read/prog cache, bytes
@@ -115,7 +785,8 @@ fn default_config() -> FsConfig
 
 // ── Errors ──────────────────────────────────────────────────────────
 
-@value
+// What an operation answers: EOk, or why it did not happen.
+pub @value
 enum FsError
     EOk
     EIo   // device read/prog/erase/sync failed
@@ -155,7 +826,10 @@ fn err_str(e: FsError) -> Str
 
 // ── Mounted-volume info ─────────────────────────────────────────────
 
-@value
+// The superblock's facts about a mounted volume: the format version,
+// the geometry and the limits it was formatted with, and which block of
+// the root pair and which revision won at mount time.
+pub @value
 struct FsInfo
     version: Int
     block_size: Int
@@ -167,7 +841,8 @@ struct FsInfo
     rev: Int   // winning superblock revision at mount time
     active_meta: Int   // which root pair block won at mount time (0 or 1)
 
-@value
+// The outcome of a mount: the volume's facts, or why it did not mount.
+pub @value
 enum MountRes
     MOk(info: FsInfo)
     MErr(e: FsError)
@@ -187,7 +862,7 @@ fn max2(a: Int, b: Int) -> Int
 // small for the superblock, a cache that is not a whole number of
 // pages, or a record the configuration allows that would not fit a
 // Buf.
-pub @tier(embedded)
+@tier(embedded)
 fn validate<D: Flash[e]>(dev: D, cfg: FsConfig) -> FsError [mutate, e]
     let rs = dev.read_size()
     let ps = dev.prog_size()
@@ -203,7 +878,7 @@ fn validate<D: Flash[e]>(dev: D, cfg: FsConfig) -> FsError [mutate, e]
     else if bc < 2
         // the superblock pair alone needs two blocks
         EInvalidConfig
-    else if bs < meta.meta_off(dev) + 4 + SB_PAYLOAD_LEN + 4
+    else if bs < meta_off(dev) + 4 + SB_PAYLOAD_LEN + 4
         // revision page + one superblock record must fit one block
         EInvalidConfig
     else if cfg.cache_size < ps or cfg.cache_size % ps != 0 or cfg.cache_size > BUF_CAP
@@ -298,14 +973,14 @@ fn key_of_str(var k: NameBuf, p: Str, sp: Span)
 fn key_of_flash<D: Flash[e]>(var k: NameBuf, dev: D, blk: Int, off: Int, len: Int) [mutate, e]
     k.clear()
     for i in 0..len
-        let _ = k.push((meta.rd8(dev, blk, off + i) & 255) as u8)
+        let _ = k.push((rd8(dev, blk, off + i) & 255) as u8)
 
 @tier(embedded)
 fn key_eq<D: Flash[e]>(dev: D, blk: Int, off: Int, len: Int, var key: NameBuf) -> Bool [mutate, e]
     if len != key.len()
         return false
     for i in 0..len
-        if meta.rd8(dev, blk, off + i) != (key[i] as Int)
+        if rd8(dev, blk, off + i) != (key[i] as Int)
             return false
     true
 
@@ -335,17 +1010,12 @@ fn no_ent() -> Ent
           name_off: 0, name_len: 0, data_off: 0 }
 
 // Byte size of a file entry; 0 for a directory.
-pub @tier(embedded)
+@tier(embedded)
 fn ent_size(e: Ent) -> Int
     if (e.kind as Int) == KIND_FILE_INLINE or (e.kind as Int) == KIND_FILE_CTZ
         e.size as Int
     else
         0
-
-// The name byte `i` of an entry.
-@tier(embedded)
-fn op_ent_name_byte<D: Flash[e]>(dev: D, en: Ent, i: Int) -> Int [mutate, e]
-    meta.rd8(dev, en.blk as Int, en.name_off as Int + i)
 
 // The dirent record `r` of block `blk`, decoded.  A payload shorter
 // than its header claims cannot pass the CRC; the decode stays
@@ -357,9 +1027,9 @@ fn dec_dirent<D: Flash[e]>(dev: D, blk: Int, r: RecAt) -> Ent [mutate, e]
     var kind = 0
     var nlen = 0
     if (r.len as Int) >= 1
-        kind = meta.rd8(dev, blk, p)
+        kind = rd8(dev, blk, p)
     if (r.len as Int) >= 2
-        nlen = meta.rd8(dev, blk, p + 1)
+        nlen = rd8(dev, blk, p + 1)
     if kind == KIND_FILE_INLINE
         var dl = r.len as Int - 2 - nlen
         if dl < 0
@@ -370,9 +1040,9 @@ fn dec_dirent<D: Flash[e]>(dev: D, blk: Int, r: RecAt) -> Ent [mutate, e]
         var p0 = 0
         var p1 = 0
         if 2 + nlen + 4 <= (r.len as Int)
-            p0 = meta.rd32(dev, blk, p + 2 + nlen)
+            p0 = rd32(dev, blk, p + 2 + nlen)
         if 2 + nlen + 8 <= (r.len as Int)
-            p1 = meta.rd32(dev, blk, p + 2 + nlen + 4)
+            p1 = rd32(dev, blk, p + 2 + nlen + 4)
         var sz = 0
         if kind == KIND_FILE_CTZ
             sz = p1
@@ -390,8 +1060,8 @@ struct RenNames
 @tier(embedded)
 fn ren_names<D: Flash[e]>(dev: D, blk: Int, r: RecAt) -> RenNames [mutate, e]
     let p = r.off as Int + 4
-    let olen = meta.rd8(dev, blk, p)
-    let nlen = meta.rd8(dev, blk, p + 1 + olen)
+    let olen = rd8(dev, blk, p)
+    let nlen = rd8(dev, blk, p + 1 + olen)
     RenNames { old_off: p + 1, old_len: olen, new_off: p + 2 + olen, new_len: nlen }
 
 // ── Resolving a name ────────────────────────────────────────────────
@@ -416,18 +1086,18 @@ struct Hit
 @tier(embedded)
 fn last_hit<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf) -> Hit [mutate, e]
     var hit = Hit { kind: HIT_NONE, rec: RecAt { ok: false, rtype: 0, len: 0, off: 0, next: 0 } }
-    var off = meta.meta_off(dev)
+    var off = meta_off(dev)
     for step in 0..limit + 1
-        let r = meta.rec_at(dev, blk, off, limit)
+        let r = rec_at(dev, blk, off, limit)
         if not r.ok
             break
         off = r.next as Int
         if (r.rtype as Int) == REC_DIRENT
-            let nlen = meta.rd8(dev, blk, r.off as Int + 5)
+            let nlen = rd8(dev, blk, r.off as Int + 5)
             if key_eq(dev, blk, r.off as Int + 6, nlen, key)
                 hit = Hit { kind: HIT_DIRENT, rec: r }
         else if (r.rtype as Int) == REC_TOMBSTONE
-            let tlen = meta.rd8(dev, blk, r.off as Int + 4)
+            let tlen = rd8(dev, blk, r.off as Int + 4)
             if key_eq(dev, blk, r.off as Int + 5, tlen, key)
                 hit = Hit { kind: HIT_GONE, rec: r }
         else if (r.rtype as Int) == REC_RENAME
@@ -509,7 +1179,7 @@ fn resolve_hop<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf, var 
 fn renamed<D: Flash[e]>(dev: D, blk: Int, limit: Int, en: Ent, first_off: Int) -> Ent [mutate, e]
     if first_off < 0
         return en
-    let r = meta.rec_at(dev, blk, first_off, limit)
+    let r = rec_at(dev, blk, first_off, limit)
     let rn = ren_names(dev, blk, r)
     Ent { found: true, kind: en.kind, pair0: en.pair0, pair1: en.pair1,
           size: en.size, blk: en.blk, name_off: rn.new_off as u32,
@@ -540,16 +1210,16 @@ fn removed_after<D: Flash[e]>(dev: D, blk: Int, from: Int, limit: Int,
                               var key: NameBuf) -> Bool [mutate, e]
     var off = from
     for step in 0..limit + 1
-        let r = meta.rec_at(dev, blk, off, limit)
+        let r = rec_at(dev, blk, off, limit)
         if not r.ok
             break
         off = r.next as Int
         if (r.rtype as Int) == REC_DIRENT
-            let nlen = meta.rd8(dev, blk, r.off as Int + 5)
+            let nlen = rd8(dev, blk, r.off as Int + 5)
             if key_eq(dev, blk, r.off as Int + 6, nlen, key)
                 return true
         else if (r.rtype as Int) == REC_TOMBSTONE
-            let tlen = meta.rd8(dev, blk, r.off as Int + 4)
+            let tlen = rd8(dev, blk, r.off as Int + 4)
             if key_eq(dev, blk, r.off as Int + 5, tlen, key)
                 return true
         else if (r.rtype as Int) == REC_RENAME
@@ -566,7 +1236,7 @@ fn op_dir_next<D: Flash[e]>(dev: D, var cur: DirCur) -> Ent [mutate, e]
     // until it is resolved and then its new one.
     var key: NameBuf = Vec.new()
     for step in 0..cur.limit + 1
-        let r = meta.rec_at(dev, cur.blk, cur.off, cur.limit)
+        let r = rec_at(dev, cur.blk, cur.off, cur.limit)
         if not r.ok
             break
         cur.off = r.next as Int
@@ -600,8 +1270,8 @@ struct PairState
 
 @tier(embedded)
 fn pair_state<D: Flash[e]>(dev: D, b0: Int, b1: Int) -> PairState [mutate, e]
-    let s0 = meta.scan(dev, b0)
-    let s1 = meta.scan(dev, b1)
+    let s0 = scan(dev, b0)
+    let s1 = scan(dev, b1)
     // A block whose log is torn before its first record does not win
     // over a sibling that is not, whatever its revision word reads.  An
     // erase cut short leaves the unit's bytes undefined, so a block the
@@ -610,7 +1280,7 @@ fn pair_state<D: Flash[e]>(dev: D, b0: Int, b1: Int) -> PairState [mutate, e]
     // then had its first append torn loses nothing by the rule: its
     // sibling's log folds to the same state, which is what the
     // compaction copied.
-    let m0 = meta.meta_off(dev)
+    let m0 = meta_off(dev)
     let bare0 = s0.torn and (s0.limit as Int) <= m0
     let bare1 = s1.torn and (s1.limit as Int) <= m0
     if s0.valid and s1.valid and bare1 and not bare0
@@ -631,7 +1301,7 @@ fn pair_state<D: Flash[e]>(dev: D, b0: Int, b1: Int) -> PairState [mutate, e]
 
 @tier(embedded)
 fn dir_cur<D: Flash[e]>(dev: D, ps: PairState) -> DirCur [e]
-    DirCur { blk: ps.blk as Int, limit: ps.sc.limit as Int, off: meta.meta_off(dev) }
+    DirCur { blk: ps.blk as Int, limit: ps.sc.limit as Int, off: meta_off(dev) }
 
 @tier(embedded)
 fn find<D: Flash[e]>(dev: D, ps: PairState, var key: NameBuf) -> Ent [mutate, e]
@@ -646,9 +1316,9 @@ fn dir_is_empty<D: Flash[e]>(dev: D, ps: PairState) -> Bool [mutate, e]
 @tier(embedded)
 fn find_sb<D: Flash[e]>(dev: D, blk: Int, limit: Int) -> RecAt [mutate, e]
     var hit = RecAt { ok: false, rtype: 0, len: 0, off: 0, next: 0 }
-    var off = meta.meta_off(dev)
+    var off = meta_off(dev)
     for step in 0..limit + 1
-        let r = meta.rec_at(dev, blk, off, limit)
+        let r = rec_at(dev, blk, off, limit)
         if not r.ok
             break
         off = r.next as Int
@@ -688,7 +1358,7 @@ fn file_cur() -> FileCur
 @tier(embedded)
 fn ent_byte<D: Flash[e]>(dev: D, en: Ent, var fc: FileCur, pos: Int) -> Int [mutate, e]
     if (en.kind as Int) == KIND_FILE_INLINE
-        meta.rd8(dev, en.blk as Int, en.data_off as Int + pos)
+        rd8(dev, en.blk as Int, en.data_off as Int + pos)
     else
         let bc = dev.block_count()
         let k = ctz_k(bc)
@@ -700,7 +1370,7 @@ fn ent_byte<D: Flash[e]>(dev: D, en: Ent, var fc: FileCur, pos: Int) -> Int [mut
         if fc.id == CTZ_NONE
             -1
         else
-            meta.rd8(dev, fc.id, 4 * k + pos % cap)
+            rd8(dev, fc.id, 4 * k + pos % cap)
 
 @tier(embedded)
 fn dat_byte<D: Flash[e], S: ByteSrc>(dev: D, d: DataSpec, var fc: FileCur, src: S,
@@ -742,32 +1412,32 @@ fn spec_len(s: Spec) -> Int
 @tier(embedded)
 fn put_str<D: Flash[e]>(dev: D, s: Str, sp: Span) [mutate, e]
     for i in sp.lo..sp.hi
-        meta.rec_byte(dev, str.byte_at_or(s, i, 0))
+        rec_byte(dev, str.byte_at_or(s, i, 0))
 
-// Writes `s` as one record through meta.nv's writer.
+// Writes `s` as one record through nv's writer.
 @tier(embedded)
 fn emit_spec<D: Flash[e]>(dev: D, s: Spec, sa: Str, sb: Str, var data: Buf) -> Bool [mutate, e]
     let alen = s.a.hi - s.a.lo
-    meta.rec_head(dev, s.rtype, spec_len(s))
+    rec_head(dev, s.rtype, spec_len(s))
     if s.rtype == REC_DIRENT
-        meta.rec_byte(dev, s.kind)
-        meta.rec_byte(dev, alen)
+        rec_byte(dev, s.kind)
+        rec_byte(dev, alen)
         put_str(dev, sa, s.a)
         if s.kind == KIND_FILE_INLINE
             for k in 0..s.p1
-                meta.rec_byte(dev, data[k] as Int)
+                rec_byte(dev, data[k] as Int)
         else
-            meta.rec_u32(dev, s.p0)
-            meta.rec_u32(dev, s.p1)
+            rec_u32(dev, s.p0)
+            rec_u32(dev, s.p1)
     else if s.rtype == REC_TOMBSTONE
-        meta.rec_byte(dev, alen)
+        rec_byte(dev, alen)
         put_str(dev, sa, s.a)
     else
-        meta.rec_byte(dev, alen)
+        rec_byte(dev, alen)
         put_str(dev, sa, s.a)
-        meta.rec_byte(dev, s.b.hi - s.b.lo)
+        rec_byte(dev, s.b.hi - s.b.lo)
         put_str(dev, sb, s.b)
-    meta.rec_tail(dev)
+    rec_tail(dev)
     true
 
 // Payload length of a live entry re-encoded as a dirent.
@@ -782,36 +1452,36 @@ fn ent_rec_len(en: Ent) -> Int
 // wherever they sit in the old block.
 @tier(embedded)
 fn emit_ent<D: Flash[e]>(dev: D, en: Ent) -> Bool [mutate, e]
-    meta.rec_head(dev, REC_DIRENT, ent_rec_len(en))
-    meta.rec_byte(dev, en.kind as Int)
-    meta.rec_byte(dev, en.name_len as Int)
+    rec_head(dev, REC_DIRENT, ent_rec_len(en))
+    rec_byte(dev, en.kind as Int)
+    rec_byte(dev, en.name_len as Int)
     for i in 0..en.name_len as Int
-        let b = meta.rd8(dev, en.blk as Int, en.name_off as Int + i)
+        let b = rd8(dev, en.blk as Int, en.name_off as Int + i)
         if b < 0
             return false
-        meta.rec_byte(dev, b)
+        rec_byte(dev, b)
     if (en.kind as Int) == KIND_FILE_INLINE
         for i in 0..en.size as Int
-            let b = meta.rd8(dev, en.blk as Int, en.data_off as Int + i)
+            let b = rd8(dev, en.blk as Int, en.data_off as Int + i)
             if b < 0
                 return false
-            meta.rec_byte(dev, b)
+            rec_byte(dev, b)
     else
-        meta.rec_u32(dev, en.pair0 as Int)
-        meta.rec_u32(dev, en.pair1 as Int)
-    meta.rec_tail(dev)
+        rec_u32(dev, en.pair0 as Int)
+        rec_u32(dev, en.pair1 as Int)
+    rec_tail(dev)
     true
 
 // Copies a record's payload unchanged (the superblock, at compaction).
 @tier(embedded)
 fn emit_raw<D: Flash[e]>(dev: D, blk: Int, r: RecAt) -> Bool [mutate, e]
-    meta.rec_head(dev, r.rtype as Int, r.len as Int)
+    rec_head(dev, r.rtype as Int, r.len as Int)
     for i in 0..r.len as Int
-        let b = meta.rd8(dev, blk, r.off as Int + 4 + i)
+        let b = rd8(dev, blk, r.off as Int + 4 + i)
         if b < 0
             return false
-        meta.rec_byte(dev, b)
-    meta.rec_tail(dev)
+        rec_byte(dev, b)
+    rec_tail(dev)
     true
 
 // Bytes the live state of a pair takes when compacted: the last
@@ -822,13 +1492,13 @@ fn keep_size<D: Flash[e]>(dev: D, ps: PairState) -> Int [mutate, e]
     var n = 0
     let sbr = find_sb(dev, ps.blk as Int, ps.sc.limit as Int)
     if sbr.ok
-        n = n + meta.rec_size(sbr.len as Int, prog)
+        n = n + rec_size(sbr.len as Int, prog)
     var cur = dir_cur(dev, ps)
     for step in 0..ps.sc.limit as Int + 1
         let en = op_dir_next(dev, cur)
         if not en.found
             break
-        n = n + meta.rec_size(ent_rec_len(en), prog)
+        n = n + rec_size(ent_rec_len(en), prog)
     n
 
 // Compacts into block `dst` with revision `rev`: erase, the live state
@@ -838,17 +1508,17 @@ fn keep_size<D: Flash[e]>(dev: D, ps: PairState) -> Int [mutate, e]
 @tier(embedded)
 fn compact<D: Flash[e]>(dev: D, src_blk: Int, src_limit: Int, dst: Int, rev: Int, with_spec: Bool,
                         s: Spec, sa: Str, sb: Str, var data: Buf) -> Int [mutate, e]
-    meta.cache_forget(dst)
+    cache_forget(dst)
     if not dev.erase(dst)
         return -1
-    meta.wr_begin(dev, dst, meta.meta_off(dev))
-    meta.rec_reset(meta.meta_off(dev))
+    wr_begin(dev, dst, meta_off(dev))
+    rec_reset(meta_off(dev))
     var ok = true
     if src_blk >= 0
         let sbr = find_sb(dev, src_blk, src_limit)
         if sbr.ok
             ok = emit_raw(dev, src_blk, sbr)
-        var cur = DirCur { blk: src_blk, limit: src_limit, off: meta.meta_off(dev) }
+        var cur = DirCur { blk: src_blk, limit: src_limit, off: meta_off(dev) }
         for step in 0..src_limit + 1
             if not ok
                 break
@@ -858,15 +1528,15 @@ fn compact<D: Flash[e]>(dev: D, src_blk: Int, src_limit: Int, dst: Int, rev: Int
             ok = emit_ent(dev, en)
     if ok and with_spec
         ok = emit_spec(dev, s, sa, sb, data)
-    let end = meta.wr_pos()
-    let limit = meta.rec_end()
-    if not meta.wr_finish(dev) or not ok
+    let end = wr_pos()
+    let limit = rec_end()
+    if not wr_finish(dev) or not ok
         return -1
     if not dev.sync()
         return -1
-    if not meta.seal(dev, dst, rev)
+    if not seal(dev, dst, rev)
         return -1
-    meta.scan_note(dst, meta.scan_of(rev, limit, dev.prog_size()))
+    scan_note(dst, scan_of(rev, limit, dev.prog_size()))
     end
 
 // ── Commit ──────────────────────────────────────────────────────────
@@ -884,18 +1554,18 @@ fn commit<D: Flash[e]>(dev: D, b0: Int, b1: Int, s: Spec, sa: Str, sb: Str,
         return ECorrupt
     let prog = dev.prog_size()
     let bs = dev.block_size()
-    let padded = meta.rec_size(spec_len(s), prog)
+    let padded = rec_size(spec_len(s), prog)
     if not ps.sc.torn and ps.sc.end_off as Int + padded <= bs
-        meta.wr_begin(dev, ps.blk as Int, ps.sc.end_off as Int)
+        wr_begin(dev, ps.blk as Int, ps.sc.end_off as Int)
         let ok = emit_spec(dev, s, sa, sb, data)
-        if meta.wr_finish(dev) and ok and dev.sync()
+        if wr_finish(dev) and ok and dev.sync()
             // The block's log now ends after this record, which the
             // append programmed whole.
-            meta.scan_note(ps.blk as Int, meta.scan_of(ps.sc.rev as Int, meta.rec_end(), prog))
+            scan_note(ps.blk as Int, scan_of(ps.sc.rev as Int, rec_end(), prog))
             EOk
         else
             EIo
-    else if meta.meta_off(dev) + keep_size(dev, ps) + padded > bs
+    else if meta_off(dev) + keep_size(dev, ps) + padded > bs
         ENoSpace
     else if compact(dev,
         ps.blk as Int,
@@ -948,7 +1618,7 @@ fn maybe_relocate<D: Flash[e]>(dev: D, info: FsInfo, path: Str, upto: Int) -> Fs
                 nvfs_stage) < 0
                 retire_block(g0)
                 return EIo
-            meta.cache_forget(g1)
+            cache_forget(g1)
             if not dev.erase(g1)
                 retire_block(g1)
                 return EIo
@@ -999,36 +1669,41 @@ fn sb_cycles_dec(c: Int) -> Int
 
 // Writes an empty volume on `dev` with `cfg`: block 0 holds the
 // superblock and the root directory, block 1 is erased, and every
-// other block is free.  Answers EInvalidConfig when `validate` does,
+// other block is free.  It forgets the blocks retired after failures
+// and starts the allocator from its first block, as a fresh volume.
+// Answers EInvalidConfig for a configuration the device cannot hold,
 // and EIo when the device refuses an erase, a prog or a sync.
 pub @tier(embedded)
 fn format<D: Flash[e]>(dev: D, cfg: FsConfig) -> FsError [mutate, e]
     state_drop()
+    // A fresh volume: the allocator starts again from its first block,
+    // and no block is remembered as retired.
+    wear_reset()
     match validate(dev, cfg)
         EOk =>
-            meta.cache_forget(1)
+            cache_forget(1)
             if not dev.erase(1)
                 return EIo
-            meta.cache_forget(0)
+            cache_forget(0)
             if not dev.erase(0)
                 return EIo
-            meta.wr_begin(dev, 0, meta.meta_off(dev))
-            meta.rec_head(dev, REC_SUPERBLOCK, SB_PAYLOAD_LEN)
-            meta.rec_byte(dev, MAGIC0)
-            meta.rec_byte(dev, MAGIC1)
-            meta.rec_byte(dev, MAGIC2)
-            meta.rec_byte(dev, MAGIC3)
-            meta.rec_u32(dev, VERSION)
-            meta.rec_u32(dev, dev.block_size())
-            meta.rec_u32(dev, dev.block_count())
-            meta.rec_u32(dev, cfg.name_max)
-            meta.rec_u32(dev, cfg.inline_max)
-            meta.rec_u32(dev, cfg.file_max)
-            meta.rec_u32(dev, sb_cycles_enc(cfg.block_cycles))
-            meta.rec_tail(dev)
-            if not meta.wr_finish(dev) or not dev.sync()
+            wr_begin(dev, 0, meta_off(dev))
+            rec_head(dev, REC_SUPERBLOCK, SB_PAYLOAD_LEN)
+            rec_byte(dev, MAGIC0)
+            rec_byte(dev, MAGIC1)
+            rec_byte(dev, MAGIC2)
+            rec_byte(dev, MAGIC3)
+            rec_u32(dev, VERSION)
+            rec_u32(dev, dev.block_size())
+            rec_u32(dev, dev.block_count())
+            rec_u32(dev, cfg.name_max)
+            rec_u32(dev, cfg.inline_max)
+            rec_u32(dev, cfg.file_max)
+            rec_u32(dev, sb_cycles_enc(cfg.block_cycles))
+            rec_tail(dev)
+            if not wr_finish(dev) or not dev.sync()
                 return EIo
-            if not meta.seal(dev, 0, 1)
+            if not seal(dev, 0, 1)
                 return EIo
             if not dev.sync()
                 EIo
@@ -1044,14 +1719,14 @@ fn sb_field<D: Flash[e]>(dev: D, blk: Int, r: RecAt, at: Int) -> Int [mutate, e]
     if at + 4 > (r.len as Int)
         -1
     else
-        meta.rd32(dev, blk, r.off as Int + 4 + at)
+        rd32(dev, blk, r.off as Int + 4 + at)
 
 @tier(embedded)
 fn sb_byte<D: Flash[e]>(dev: D, blk: Int, r: RecAt, at: Int) -> Int [mutate, e]
     if at >= (r.len as Int)
         -1
     else
-        meta.rd8(dev, blk, r.off as Int + 4 + at)
+        rd8(dev, blk, r.off as Int + 4 + at)
 
 @tier(embedded)
 fn parse_sb<D: Flash[e]>(dev: D, rev: Int, active: Int, blk: Int, r: RecAt) -> MountRes [mutate, e]
@@ -1106,8 +1781,8 @@ fn mount_dev<D: Flash[e]>(dev: D) -> MountRes [mutate, e]
             parse_sb(dev, ps.sc.rev as Int, 1, ps.blk as Int, sbr)
     else
         // neither block valid: fresh device or wreckage?
-        let s0 = meta.scan(dev, 0)
-        let s1 = meta.scan(dev, 1)
+        let s0 = scan(dev, 0)
+        let s1 = scan(dev, 1)
         if s0.torn or s1.torn
             MErr(ECorrupt)
         else
@@ -1196,7 +1871,7 @@ fn is_retired(b: Int) -> Bool [mutate]
 
 // Forgets the allocator's cursor and the blocks it retired after a
 // failure, for a program that starts over on a fresh device.
-pub @tier(embedded)
+@tier(embedded)
 fn wear_reset() [mutate]
     alloc_cursor = 2
     retired.clear()
@@ -1229,7 +1904,7 @@ fn ctz_nblocks(size: Int, cap: Int) -> Int
 // skip pointer j of a data block (block id at chain index cur - 2^j)
 @tier(embedded)
 fn ctz_ptr<D: Flash[e]>(dev: D, blk: Int, j: Int) -> Int [mutate, e]
-    let v = meta.rd32(dev, blk, 4 * j)
+    let v = rd32(dev, blk, 4 * j)
     if v < 0
         CTZ_NONE
     else
@@ -1443,7 +2118,7 @@ fn op_mkdir<D: Flash[e]>(dev: D, info: FsInfo, path: Str) -> FsError [mutate, e]
                 let c1 = alloc_next(dev)
                 if c0 < 0 or c1 < 0
                     return ENoSpace
-                meta.cache_forget(c1)
+                cache_forget(c1)
                 if not dev.erase(c1)
                     retire_block(c1)
                 else if compact(dev, -1, 0, c0, 1, false, no_spec(), path, path, nvfs_stage) < 0
@@ -1472,16 +2147,6 @@ fn op_dir_open<D: Flash[e]>(dev: D, path: Str) -> DirOpen [mutate, e]
                 DirOpen { err: ECorrupt, cur: none }
             else
                 DirOpen { err: EOk, cur: dir_cur(dev, ps) }
-
-// The directory whose pair is (b0, b1) — a DIR entry's pair0 and
-// pair1 — for a walk that goes down the tree without building paths.
-@tier(embedded)
-fn op_dir_open_pair<D: Flash[e]>(dev: D, b0: Int, b1: Int) -> DirOpen [mutate, e]
-    let ps = pair_state(dev, b0, b1)
-    if not ps.ok
-        DirOpen { err: ECorrupt, cur: DirCur { blk: 0, limit: 0, off: 0 } }
-    else
-        DirOpen { err: EOk, cur: dir_cur(dev, ps) }
 
 // remove("/a/b"): removes a file, or a directory that has no entries
 // left.  A non-empty directory is refused with ENotEmpty — there is no
@@ -1570,60 +2235,60 @@ fn op_rename<D: Flash[e]>(dev: D, info: FsInfo, old_path: Str, new_path: Str) ->
 // old file and the allocator can never hand out live data blocks.
 
 @value
-enum EntRes
-    EntOk(en: Ent)
-    EntErr(err: FsError)
+enum EntAt
+    AtOk(en: Ent)
+    AtErr(err: FsError)
 
 @tier(embedded)
-fn lookup<D: Flash[e]>(dev: D, path: Str) -> EntRes [mutate, e]
+fn lookup<D: Flash[e]>(dev: D, path: Str) -> EntAt [mutate, e]
     let n = comp_count(path)
     if n == 0
-        return EntErr(EIsDir)   // "/" is the root directory
+        return AtErr(EIsDir)   // "/" is the root directory
     match walk(dev, path, n - 1)
-        WErr(e)     => EntErr(e)
+        WErr(e)     => AtErr(e)
         WOk(p0, p1) =>
             let ps = pair_state(dev, p0, p1)
             if not ps.ok
-                return EntErr(ECorrupt)
+                return AtErr(ECorrupt)
             var key: NameBuf = Vec.new()
             key_of_str(key, path, comp_span(path, n - 1))
             let en = find(dev, ps, key)
             if en.found
-                EntOk(en)
+                AtOk(en)
             else
-                EntErr(ENotFound)
+                AtErr(ENotFound)
 
 // The entry `path` names, for a caller that reads it in pieces.
 @tier(embedded)
-fn op_stat<D: Flash[e]>(dev: D, path: Str) -> EntRes [mutate, e]
+fn op_stat<D: Flash[e]>(dev: D, path: Str) -> EntAt [mutate, e]
     lookup(dev, path)
 
 // Opens one data block of a new CTZ chain: erases it and writes its K
 // skip pointers (to the blocks at chain indices i - 2^j, found from
-// `prev`, index i - 1).  The block's data follows through meta.nv's
+// `prev`, index i - 1).  The block's data follows through nv's
 // writer, and `ctz_close` pads and programs it.  Answers whether the
 // erase succeeded.
 @tier(embedded)
 fn ctz_open<D: Flash[e]>(dev: D, id: Int, i: Int, prev: Int) -> Bool [mutate, e]
     let bc = dev.block_count()
-    meta.cache_forget(id)
+    cache_forget(id)
     if not dev.erase(id)
         return false
-    meta.wr_begin(dev, id, 0)
+    wr_begin(dev, id, 0)
     for j in 0..ctz_k(bc)
         let back = i - (1 << j)
         if back < 0
-            meta.wr_put32(dev, CTZ_NONE)
+            wr_put32(dev, CTZ_NONE)
         else if j == 0
-            meta.wr_put32(dev, prev)
+            wr_put32(dev, prev)
         else
-            meta.wr_put32(dev, ctz_seek(dev, bc, prev, i - 1, back))
+            wr_put32(dev, ctz_seek(dev, bc, prev, i - 1, back))
     true
 
 @tier(embedded)
 fn ctz_close<D: Flash[e]>(dev: D) -> Bool [mutate, e]
-    meta.wr_pad(dev)
-    meta.wr_finish(dev)
+    wr_pad(dev)
+    wr_finish(dev)
 
 // Writes a new CTZ chain holding `d`.  Answers the head block, -1 when
 // there is no space, -2 when the device failed three times (each
@@ -1655,7 +2320,7 @@ fn ctz_write<D: Flash[e], S: ByteSrc>(dev: D, d: DataSpec, src: S) -> Int [mutat
                     let b = dat_byte(dev, d, fc, src, pos)
                     if b < 0
                         return -3
-                    meta.wr_put(dev, b)
+                    wr_put(dev, b)
                 ok = ctz_close(dev)
             if ok
                 prev = id
@@ -1754,13 +2419,13 @@ fn op_file_write<D: Flash[e], S: ByteSrc>(dev: D, info: FsInfo, path: Str,
 fn op_file_append<D: Flash[e], S: ByteSrc>(dev: D, info: FsInfo, path: Str,
                                            src: S) -> FsError [mutate, e]
     match lookup(dev, path)
-        EntErr(err) =>
+        AtErr(err) =>
             match err
                 ENotFound =>
                     let d = DataSpec { old: no_ent(), old_n: 0, src_n: src.src_len(), zero_n: 0 }
                     write_data(dev, info, path, d, src)
                 e         => e
-        EntOk(en)   =>
+        AtOk(en)   =>
             if (en.kind as Int) == KIND_DIR
                 EIsDir
             else
@@ -1794,15 +2459,15 @@ fn op_file_read_at<D: Flash[e]>(dev: D, path: Str, off: Int, len: Int,
                                 var dst: Buf) -> FsError [mutate, e]
     dst.clear()
     match lookup(dev, path)
-        EntErr(err) => err
-        EntOk(en)   => op_ent_read(dev, en, off, len, dst)
+        AtErr(err) => err
+        AtOk(en)   => op_ent_read(dev, en, off, len, dst)
 
 // byte size of a file; -1 when missing or a directory
 @tier(embedded)
 fn op_file_size<D: Flash[e]>(dev: D, path: Str) -> Int [mutate, e]
     match lookup(dev, path)
-        EntErr(err) => 0 - 1
-        EntOk(en)   =>
+        AtErr(err) => 0 - 1
+        AtOk(en)   =>
             if (en.kind as Int) == KIND_DIR
                 0 - 1
             else
@@ -1814,8 +2479,8 @@ fn op_file_truncate<D: Flash[e]>(dev: D, info: FsInfo, path: Str,
     if new_len < 0
         return EInvalidConfig
     match lookup(dev, path)
-        EntErr(err) => err
-        EntOk(en)   =>
+        AtErr(err) => err
+        AtOk(en)   =>
             if (en.kind as Int) == KIND_DIR
                 return EIsDir
             let cur = ent_size(en)
@@ -1824,11 +2489,11 @@ fn op_file_truncate<D: Flash[e]>(dev: D, info: FsInfo, path: Str,
             else if new_len > cur
                 // extend with zeros (whole-file rewrite)
                 let d = DataSpec { old: en, old_n: cur, src_n: 0, zero_n: new_len - cur }
-                write_data(dev, info, path, d, flash.no_src())
+                write_data(dev, info, path, d, no_src())
             else if new_len <= info.inline_max or (en.kind as Int) == KIND_FILE_INLINE
                 // shrink into an inline entry
                 let d = DataSpec { old: en, old_n: new_len, src_n: 0, zero_n: 0 }
-                write_data(dev, info, path, d, flash.no_src())
+                write_data(dev, info, path, d, no_src())
             else
                 // CTZ shrink: the chain prefix stays valid — reuse it
                 let bc = dev.block_count()
@@ -1872,7 +2537,11 @@ fn op_file_truncate<D: Flash[e]>(dev: D, info: FsInfo, path: Str,
 // The id the next mount gives its volume.
 var vol_next = 1
 
-struct Volume<D: Flash[e]>
+// A mounted volume, which owns its device.  `mount`, `mount_with` make
+// one, its operations are those of the `FileSystem` trait, and
+// `unmount` gives the device back.  A volume that did not mount answers
+// every operation with the mount's error.
+pub struct Volume<D: Flash[e]>
     dev: D
     info: FsInfo
     err: FsError
@@ -1887,7 +2556,7 @@ fn no_info() -> FsInfo
 // scans, and the allocator's window.
 @tier(embedded)
 fn state_drop() [mutate]
-    meta.cache_drop()
+    cache_drop()
     la_base = -1
     la_whole = true
 
@@ -1895,7 +2564,7 @@ fn state_drop() [mutate]
 // volume left.
 @tier(embedded)
 fn vol_claim(id: Int) [mutate]
-    if meta.claim(id)
+    if claim(id)
         la_base = -1
         la_whole = true
 
@@ -1906,7 +2575,7 @@ fn vol_claim(id: Int) [mutate]
 fn volume_of<D: Flash[e]>(dev: D, r: MountRes) -> Volume<D> [mutate]
     let id = vol_next
     vol_next = vol_next + 1
-    meta.adopt(id)
+    adopt(id)
     var info = no_info()
     var err = EOk
     match r
@@ -1960,11 +2629,106 @@ impl Volume
     // kept is dropped.
     @tier(embedded)
     fn unmount(self) -> D [mutate]
-        if meta.release(self.id)
+        if release(self.id)
             la_base = -1
             la_whole = true
         self.dev
 
+// ── Entries and listings ────────────────────────────────────────────
+
+// One entry of a directory: a file or a directory, its size, and its
+// name.  `name` holds the name's bytes, at most `name_max` of them.
+pub @value
+struct Entry
+    is_dir: Bool
+    size: Int
+    name: NameBuf
+
+impl Entry
+    // The entry's name as a string.  The string is allocated: on a
+    // board, from the arena, so a caller is a function at the rt tier.
+    //
+    // ```novo
+    // var name: NameBuf = Vec.new()
+    // let _ = name.push(0x6c)
+    // let _ = name.push(0x6f)
+    // let _ = name.push(0x67)
+    // println(Entry { is_dir: false, size: 0, name: name }.name_str())   // log
+    // ```
+    @tier(rt)
+    fn name_str(self) -> Str
+        var out = bytes.zeros(self.name.len())
+        for i in 0..self.name.len()
+            out = bytes.set_u8(out, i, self.name[i] as Int)
+        bytes.to_str(out)
+
+// The answer of `stat`: the entry a path names, or why there is none.
+pub @value
+enum EntRes
+    EntOk(en: Entry)
+    EntErr(err: FsError)
+
+// A directory being listed: `list` opens one and `list_next` reads its
+// entries in order.  `err` is EOk for a directory that opened, and the
+// reason otherwise; the other fields are the position in its log.
+pub @value
+struct Listing
+    err: FsError
+    blk: Int
+    limit: Int
+    off: Int
+
+// The public entry of an internal one, its name copied off the flash.
+@tier(embedded)
+fn entry_of<D: Flash[e]>(dev: D, en: Ent) -> Entry [mutate, e]
+    var name: NameBuf = Vec.new()
+    key_of_flash(name, dev, en.blk as Int, en.name_off as Int, en.name_len as Int)
+    Entry { is_dir: (en.kind as Int) == KIND_DIR, size: ent_size(en), name: name }
+
+@tier(embedded)
+fn listing_of(o: DirOpen) -> Listing
+    Listing { err: o.err, blk: o.cur.blk, limit: o.cur.limit, off: o.cur.off }
+
+// ── One interface: the FileSystem trait ─────────────────────────────
+
+// The operations of a filesystem, each taking a path.  A volume
+// implements it, and so can another filesystem, so a program written
+// against the trait runs on either.
+//
+// There are no open file handles: every operation is one committed
+// change or one read, from a path.  An operation a filesystem cannot
+// perform answers ENotSupported.  The trait binds one effect parameter,
+// and a volume supplies the effects of its device.
+pub trait FileSystem[e]
+    // Creates the directory `path`; its parent must exist and the name
+    // must not.
+    fn mkdir(self, path: Str) -> FsError [e]
+    // Removes a file, or a directory with no entries left.
+    fn remove(self, path: Str) -> FsError [e]
+    // Renames `old_path` to `new_path` within one directory.
+    fn rename(self, old_path: Str, new_path: Str) -> FsError [e]
+    // The entry `path` names, or why there is none.
+    fn stat(self, path: Str) -> EntRes [e]
+    // Opens the directory `path` for `list_next`.
+    fn list(self, path: Str) -> Listing [e]
+    // The next entry of a listing, which moves past it; `None` when the
+    // directory has no more.
+    fn list_next(self, var at: Listing) -> ?Entry [e]
+    // Creates or replaces the file `path` with the bytes of `src`.
+    fn file_write<S: ByteSrc>(self, path: Str, src: S) -> FsError [e]
+    // Appends the bytes of `src` to `path`; a missing file is created.
+    fn file_append<S: ByteSrc>(self, path: Str, src: S) -> FsError [e]
+    // Reads `len` bytes of `path` from `off` into `dst`, at most
+    // BUF_CAP of them.
+    fn file_read_at(self, path: Str, off: Int, len: Int, var dst: Buf) -> FsError [e]
+    // The byte size of `path`; -1 when it is missing or a directory.
+    fn file_size(self, path: Str) -> Int [e]
+    // Cuts `path` to `new_len` bytes, or extends it with zeros.
+    fn file_truncate(self, path: Str, new_len: Int) -> FsError [e]
+    // The blocks in use.
+    fn used_blocks(self) -> Int [e]
+
+impl FileSystem[mutate, e] for Volume
     // mkdir("/a/b"): the parent "/a" must exist and the leaf "b" must
     // not.
     @tier(embedded)
@@ -1994,6 +2758,40 @@ impl Volume
         vol_claim(self.id)
         op_rename(self.dev, self.info, old_path, new_path)
 
+    // The entry `path` names: a file's size, or a directory.  The root,
+    // "/", answers EIsDir.
+    @tier(embedded)
+    fn stat(self, path: Str) -> EntRes [mutate, e]
+        if self.err != EOk
+            return EntErr(self.err)
+        vol_claim(self.id)
+        match op_stat(self.dev, path)
+            AtErr(err) => EntErr(err)
+            AtOk(en)   => EntOk(entry_of(self.dev, en))
+
+    // Opens the directory `path` for listing: call `list_next` with the
+    // listing until it answers `None`.
+    @tier(embedded)
+    fn list(self, path: Str) -> Listing [mutate, e]
+        if self.err != EOk
+            return Listing { err: self.err, blk: 0, limit: 0, off: 0 }
+        vol_claim(self.id)
+        listing_of(op_dir_open(self.dev, path))
+
+    // The next live entry of the listing, which moves past it; `None`
+    // when the directory has no more, or the listing did not open.
+    @tier(embedded)
+    fn list_next(self, var at: Listing) -> ?Entry [mutate, e]
+        if self.err != EOk or at.err != EOk
+            return None
+        vol_claim(self.id)
+        var cur = DirCur { blk: at.blk, limit: at.limit, off: at.off }
+        let en = op_dir_next(self.dev, cur)
+        at.off = cur.off
+        if not en.found
+            return None
+        Some(entry_of(self.dev, en))
+
     // Creates or replaces the file `path` with the bytes of `src`.
     @tier(embedded)
     fn file_write<S: ByteSrc>(self, path: Str, src: S) -> FsError [mutate, e]
@@ -2010,22 +2808,6 @@ impl Volume
         vol_claim(self.id)
         op_file_append(self.dev, self.info, path, src)
 
-    // Cuts `path` to `new_len` bytes, or extends it with zeros.
-    @tier(embedded)
-    fn file_truncate(self, path: Str, new_len: Int) -> FsError [mutate, e]
-        if self.err != EOk
-            return self.err
-        vol_claim(self.id)
-        op_file_truncate(self.dev, self.info, path, new_len)
-
-    // The byte size of `path`; -1 when it is missing or a directory.
-    @tier(embedded)
-    fn file_size(self, path: Str) -> Int [mutate, e]
-        if self.err != EOk
-            return 0 - 1
-        vol_claim(self.id)
-        op_file_size(self.dev, path)
-
     // Reads `len` bytes of `path` from `off` into `dst`, at most
     // BUF_CAP of them.
     @tier(embedded)
@@ -2036,63 +2818,174 @@ impl Volume
         vol_claim(self.id)
         op_file_read_at(self.dev, path, off, len, dst)
 
-    // The entry `path` names, for a caller that reads it in pieces.
+    // The byte size of `path`; -1 when it is missing or a directory.
     @tier(embedded)
-    fn stat(self, path: Str) -> EntRes [mutate, e]
-        if self.err != EOk
-            return EntErr(self.err)
-        vol_claim(self.id)
-        op_stat(self.dev, path)
-
-    // Reads `len` bytes of the entry `en` from `off` into `dst`, at
-    // most BUF_CAP of them.
-    @tier(embedded)
-    fn ent_read(self, en: Ent, off: Int, len: Int, var dst: Buf) -> FsError [mutate, e]
-        if self.err != EOk
-            dst.clear()
-            return self.err
-        vol_claim(self.id)
-        op_ent_read(self.dev, en, off, len, dst)
-
-    // The name byte `i` of the entry `en`.
-    @tier(embedded)
-    fn ent_name_byte(self, en: Ent, i: Int) -> Int [mutate, e]
+    fn file_size(self, path: Str) -> Int [mutate, e]
         if self.err != EOk
             return 0 - 1
         vol_claim(self.id)
-        op_ent_name_byte(self.dev, en, i)
+        op_file_size(self.dev, path)
 
-    // Opens the directory `path` for listing: call `dir_next` with the
-    // cursor until the entry it answers has `found` false.
+    // Cuts `path` to `new_len` bytes, or extends it with zeros.
     @tier(embedded)
-    fn dir_open(self, path: Str) -> DirOpen [mutate, e]
+    fn file_truncate(self, path: Str, new_len: Int) -> FsError [mutate, e]
         if self.err != EOk
-            return DirOpen { err: self.err, cur: DirCur { blk: 0, limit: 0, off: 0 } }
+            return self.err
         vol_claim(self.id)
-        op_dir_open(self.dev, path)
+        op_file_truncate(self.dev, self.info, path, new_len)
 
-    // Opens the directory whose pair is (b0, b1), a directory entry's
-    // pair0 and pair1, for a walk down the tree that builds no paths.
-    @tier(embedded)
-    fn dir_open_pair(self, b0: Int, b1: Int) -> DirOpen [mutate, e]
-        if self.err != EOk
-            return DirOpen { err: self.err, cur: DirCur { blk: 0, limit: 0, off: 0 } }
-        vol_claim(self.id)
-        op_dir_open_pair(self.dev, b0, b1)
-
-    // The next live entry at or after the cursor, which moves past it;
-    // an entry with `found` false when the directory has no more.
-    @tier(embedded)
-    fn dir_next(self, var cur: DirCur) -> Ent [mutate, e]
-        if self.err != EOk
-            return no_ent()
-        vol_claim(self.id)
-        op_dir_next(self.dev, cur)
-
-    // The blocks reachable from the root.
+    // The blocks reachable from the root; -1 for a volume that did not
+    // mount.
     @tier(embedded)
     fn used_blocks(self) -> Int [mutate, e]
         if self.err != EOk
             return 0 - 1
         vol_claim(self.id)
         op_used_blocks(self.dev)
+
+// ── On a board: RegionFlash ─────────────────────────────────────────
+//
+// A board with a flash driver names it for `hal.block` and states the
+// bytes it may erase and write, `block_region` in its manifest, or the
+// data region of its `[flash]` table, which names the same bytes.  The
+// region surface reaches those bytes by offset, in the units the flash
+// erases and programs: `hal.block.erase_size()` and `write_size()`,
+// `read_at(off, n)`, `write_at(off, n)` and `erase_at(off)`, with the
+// bytes crossing through the device's 512-byte staging buffer.  Under
+// QEMU's MPS2 machines the same surface reaches a file on the host, in
+// blocks of 512 bytes.
+//
+// One novofs block is one erase unit.  A metadata pair is two blocks
+// the filesystem erases one at a time, and a block is erased only when
+// nothing in it is live, so a block must be a unit the flash erases on
+// its own: 4096 bytes on the nRF52, 131072 on the STM32F407's top
+// sectors, 512 under QEMU.  Inside a block the filesystem appends: each
+// prog programs a few bytes of a unit already erased, and the driver
+// only clears bits.  Nothing is erased and programmed again in one
+// operation, so a reset in the middle of a prog loses at most the bytes
+// of that prog, which the record's checksum then rejects.
+//
+// The device reports a page of 16 bytes, or the flash's write unit when
+// that is larger, for reads and progs, so every prog is a whole number
+// of write units and the layout matches the images the host tool
+// writes with 16-byte pages.  The device keeps no state of its own and
+// allocates nothing.
+
+// The smallest page the device reports.
+let REGION_PAGE = 16
+
+// A partition of the board's reserved flash region as a `Flash`
+// device, one block per erase unit: `off` bytes from the region's
+// start, `count` blocks of `unit` bytes, read and programmed in pages
+// of `page` bytes.  `region_flash` and `region_flash_at` make one.
+pub @value
+struct RegionFlash
+    off: Int
+    count: Int
+    unit: Int
+    page: Int
+
+// The page the region's flash programs in: 16 bytes, or its write unit
+// when that is larger.
+@tier(embedded)
+fn region_page() -> Int [hw]
+    let w = hal.block.write_size()
+    if w > REGION_PAGE
+        // cov: skip — runs only on a board whose flash writes more than 16 bytes at a time; the host's region writes none
+        w
+    else
+        REGION_PAGE
+
+// The board's reserved region as one device: the bytes its manifest
+// names, its `block_region` or the data region of its `[flash]` table,
+// which a bootloader never writes.
+//
+// ```novo
+// fn main() [io, hw, mutate]
+//     let vol = nvfs.mount_with(nvfs.region_flash(), nvfs.default_config(), true)
+//     // On the host, which has no region: "geometry mismatch".
+//     println(nvfs.err_str(vol.status()))
+// ```
+pub @tier(embedded)
+fn region_flash() -> RegionFlash [hw]
+    region_flash_at(hal.block.region_start(), hal.block.region_bytes())
+
+// The partition of `size` bytes from the address `start`, which must lie
+// inside the reserved region and start and end on erase units.  A
+// partition that does not has no blocks, and a mount of it is refused.
+pub @tier(embedded)
+fn region_flash_at(start: Int, size: Int) -> RegionFlash [hw]
+    let base = hal.block.region_start()
+    let unit = hal.block.erase_size()
+    let off = start - base
+    let page = region_page()
+    let fits = off >= 0 and size > 0 and off + size <= hal.block.region_bytes()
+    if unit <= 0 or not fits or off % unit != 0 or size % unit != 0
+        return RegionFlash { off: 0, count: 0, unit: 0, page: page }
+    // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+    RegionFlash { off: off, count: size / unit, unit: unit, page: page }
+
+impl Flash[hw] for RegionFlash
+    @tier(embedded)
+    fn read_size(self) -> Int
+        self.page
+
+    @tier(embedded)
+    fn prog_size(self) -> Int
+        self.page
+
+    @tier(embedded)
+    fn block_size(self) -> Int
+        self.unit
+
+    @tier(embedded)
+    fn block_count(self) -> Int
+        self.count
+
+    // Replaces `dst`'s contents with the `len` bytes at (block, off).
+    @tier(embedded)
+    fn read(self, block: Int, off: Int, len: Int, var dst: Buf) -> Bool [hw]
+        dst.clear()
+        if not region_holds(self, block, off, len)
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        if hal.block.read_at(self.off + block * self.unit + off, len) != 0
+            // cov: skip — runs only when the storage refuses a read inside the region, which a chip's memory-mapped flash never does; `region_holds` has refused every read outside it
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        for i in 0..len
+            let _ = dst.push((hal.block.buf_get(i) & 255) as u8)
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        true
+
+    // Programs `src`'s bytes at (block, off), clearing bits only.
+    @tier(embedded)
+    fn prog(self, block: Int, off: Int, var src: Buf) -> Bool [hw]
+        let len = src.len()
+        if not region_holds(self, block, off, len)
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        for i in 0..len
+            hal.block.buf_set(i, src[i] as Int)
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        hal.block.write_at(self.off + block * self.unit + off, len) == 0
+
+    @tier(embedded)
+    fn erase(self, block: Int) -> Bool [hw]
+        if block < 0 or block >= self.count
+            return false
+        // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+        hal.block.erase_at(self.off + block * self.unit) == 0
+
+    @tier(embedded)
+    fn sync(self) -> Bool
+        true
+
+// Whether `len` bytes at (block, off) are inside one block of the
+// partition, on whole pages, and fit a Buf.
+@tier(embedded)
+fn region_holds(d: RegionFlash, block: Int, off: Int, len: Int) -> Bool
+    if block < 0 or block >= d.count or off < 0 or len < 0 or len > BUF_CAP
+        return false
+    // cov: skip — runs only on a board's reserved region; the host's region has no blocks
+    off + len <= d.unit and off % d.page == 0 and len % d.page == 0

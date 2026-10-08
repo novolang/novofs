@@ -1,14 +1,14 @@
 # novofs
 
-novofs is a filesystem for raw NOR-class flash that survives a power
-cut at any moment and spreads its writes over the device, written
-entirely in novo-lang.  Its on-flash format is modelled on
+novofs is a filesystem for a microcontroller's NOR flash that survives
+a power cut at any moment and spreads its writes over the device,
+written in novo-lang.  Its on-flash format is modelled on
 [littlefs](https://github.com/littlefs-project/littlefs): metadata
 pairs, commit logs checked by CRC-32C, and files kept in CTZ
-skip-lists.  A novofs volume is not a littlefs volume.  The package is
-a library, which mounts a volume on any storage that implements its
-`Flash` trait, and a command-line image tool, which builds, inspects
-and unpacks volume images on the host.
+skip-lists.  A novofs volume is not a littlefs volume.  A program
+mounts a volume on the board's reserved flash region, or on any
+storage that implements the package's `Flash` trait, and reads and
+writes files in it by path.
 
 ## What it is
 
@@ -16,7 +16,7 @@ NOR flash programs in small pages but erases in large blocks, and a
 program can only clear bits: a byte goes back to 0xFF only when its
 whole block is erased.  A filesystem on it must never program a byte
 twice without an erase between, and must leave a readable state when
-power fails in the middle of any prog or erase.
+power fails in the middle of any program or erase.
 
 Every directory, the root included, lives in a metadata pair: two
 erase blocks that hold an append-only log of records, each record
@@ -28,256 +28,228 @@ adds or replaces a name, a tombstone removes it, and a rename moves
 it.
 
 Every change to the filesystem is exactly one record, a rename
-included, so the atomicity of one record's commit is the whole of
-the crash-consistency rule.  When a record does not fit its block,
+included, so the atomicity of one record's commit is the whole of the
+crash-consistency rule.  When a record does not fit its block,
 compaction folds the live state into the sibling block with the
 revision plus one, and the new record rides inside that compaction.
 The sibling's revision word is programmed last, which seals it, so a
-compaction cut short is invisible.  An append cut short ends the log,
-and the block is treated as full.
+compaction cut short is invisible.
 
 A file of at most `inline_max` bytes lives in its directory entry.  A
 larger file lives in a CTZ skip-list of data blocks, which seeks in
-O(log n).  Writes are copy-on-write: the allocator, a rotating cursor
-over a walk of every block reachable from the root, never hands out a
-live block, so a crash in the middle of a write keeps the old file.
-Allocation rotates over the device, a metadata pair moves to fresh
-blocks every `block_cycles` compactions, and a block that fails an
-erase or a prog is retired and the operation retried.
+O(log n).  Writes are copy-on-write: the allocator never hands out a
+block a walk from the root reaches, so a cut in the middle of a write
+keeps the old file.  Allocation rotates over the device, a metadata
+pair moves to fresh blocks every `block_cycles` compactions, and a
+block that fails an erase or a program is retired and the operation
+retried.
 
-### The mounted volume
-
-`nvfs.mount(dev)` moves the device into a `Volume<D>`, and
-`vol.unmount()` gives it back.  Because nothing writes the device
-between two operations of the volume except the volume, the state one
-operation builds stays true for the next: the read cache, the last two
-block scans (a scan reads a block's whole log and checks every
-record's CRC), and the allocator's free-space window.  An append files
-the scan its block now has instead of reading the block again, so an
-operation on a volume whose metadata block is 128 KB reads the log's
-record headers, not its every byte.  A volume that did not mount
-answers every operation with the mount's error.
-
-The state is module storage of a fixed size and belongs to one volume
-at a time.  A program with two volumes mounted gets right answers from
-both; each time it moves from one to the other, the state is dropped
-and built again.  A host device that keeps a reference to shared
-storage (a `RamFlash` the caller still holds) can be written around
-the volume; such a write is seen by a volume mounted after it.
-
-The volume is the one allocation of a mount: on the STM32F407 it takes
-168 bytes of the arena, the volume and the copy of its device.  Each
-operation is charged the effects of the volume's device: the struct
-binds the `Flash` trait's effect parameter on its type parameter,
-`Volume<D: Flash[e]>`, and its methods are `[mutate, e]`
-(SPEC §5.6).
+A program reaches all of it through one module, `nvfs`.  It mounts a
+device and gets a `Volume`, the mounted volume, which owns the device.
+The volume's operations each take a path and are one committed change
+or one read: there are no open file handles.
 
 ## Install
 
 ```sh
-novo pkg add novofs       # the library, in a program's novo.toml
-novo install novofs       # the image tool, into ~/.novo/bin
-```
-
-From a checkout of this repository:
-
-```sh
-novo pkg build            # builds ./novofs, the image tool
-novo test tests           # runs the host suites
+novo pkg add novofs
 ```
 
 ## Example
 
-On the host, `hostfs` takes and answers `Bytes` and lists:
+Each example is a program for a board.  Put it in a project that
+depends on novofs as `src/main.nv`, and build and flash it for the
+board:
+
+```sh
+novo pkg init settings && cd settings
+novo pkg add novofs
+cp settings.nv src/main.nv
+novo flash --target=nrf52832-dk src/main.nv
+```
+
+The programs print on the board's console, which `novo logs
+--target=<board>` shows.  They are in this package's `examples/`.
+
+### A record that survives a reset
+
+`examples/settings.nv` mounts the board's data region, formatting it
+on the first boot, reads a record from `/settings`, writes it back with
+its boot count one higher, and reads it again.  The record is a
+`@value` struct that implements `ByteSrc`, the trait a file is written
+from.
 
 ```novo norun:needs-pkg
-use std.bytes
-use hostdev
 use nvfs
-use hostfs
-
-fn main() [io, mutate, ffi]
-    // 32 blocks of 512 bytes, read and programmed in 16-byte pages
-    let dev = hostdev.ram_flash(16, 16, 512, 32)
-    let _ = nvfs.format(dev, nvfs.default_config())
-    let vol = nvfs.mount(dev)
-    match vol.mounted()
-        MOk(info) =>
-            let _ = vol.mkdir("/logs")
-            let _ = hostfs.file_write(vol, "/logs/boot", bytes.from_str("booted"))
-            match hostfs.file_read(vol, "/logs/boot")
-                FOk(b) => println(bytes.to_str(b))
-                FErr(e) => println(nvfs.err_str(e))
-        MErr(e) => println("mount: " + nvfs.err_str(e))
-```
-
-On a device, the core itself: a file is written from a `ByteSrc`, read
-into a `Buf` the caller owns, and a directory is walked with a cursor.
-The mount allocates the volume from the arena; nothing in the calls on
-it allocates, so they run in a `@no_alloc` function:
-
-```novo norun:fragment
-use flash
-use nvfs
-use halflash
 
 @value
-struct Word
-    v: Int
+struct Settings
+    boots: Int
+    rate_hz: Int
 
-impl ByteSrc for Word
+// The record's eight bytes, two 32-bit little-endian numbers.
+impl ByteSrc for Settings
     fn src_len(self) -> Int
-        4
-    fn src_at(self, i: Int) -> Int
-        (self.v >>> (8 * i)) & 255
+        8
 
-let vol = nvfs.mount(halflash.hal_flash())    // the board's hal.block storage
-if vol.status() == EOk
-    let _ = vol.file_append("/log", Word { v: reading })
+    fn src_at(self, i: Int) -> Int
+        if i < 4
+            (self.boots >>> (8 * i)) & 255
+        else
+            (self.rate_hz >>> (8 * (i - 4))) & 255
+
+fn u32_at(var b: Buf, off: Int) -> Int
+    (b[off] as Int) | ((b[off + 1] as Int) << 8) | ((b[off + 2] as Int) << 16)
+        | ((b[off + 3] as Int) << 24)
+
+fn main() [hw, mutate, time]
+    bsp.board.init()
+    // The board's data region, formatted when it holds no filesystem.
+    let vol = nvfs.mount_with(nvfs.region_flash(), nvfs.default_config(), true)
+    if vol.status() != EOk
+        hal.uart.write("settings: mount failed\n")
+        return
+    // The record from the last boot, or the defaults on the first.
+    var s = Settings { boots: 0, rate_hz: 100 }
     var buf: Buf = Vec.new()
-    let _ = vol.file_read_at("/log", 0, 4, buf)
+    if vol.file_read_at("/settings", 0, 8, buf) == EOk and buf.len() == 8
+        s = Settings { boots: u32_at(buf, 0), rate_hz: u32_at(buf, 4) }
+    // One more boot, written as one commit.
+    s = Settings { boots: s.boots + 1, rate_hz: s.rate_hz }
+    let _ = vol.file_write("/settings", s)
+    hal.uart.write("settings: boots=")
+    hal.uart.write(str.from_int(s.boots))
+    hal.uart.write("\n")
 ```
+
+Each reset of the board starts the program again, and the count it
+prints is one higher:
+
+```text
+settings: mounted
+settings: boots=3 rate=100
+settings: read back boots=3 rate=100
+```
+
+### A log of readings
+
+`examples/logger.nv` keeps a log the way a sensor node does: each
+reading is a four-byte record, a sequence number and a value, appended
+to `/log` as one commit.  At start the program reads the last record
+to find where it left off.  When the volume is full the log starts
+again from the record that did not fit.
+
+```novo norun:fragment
+let r = Record { seq: seq, reading: sample }
+var rc = vol.file_append("/log", r)
+if rc == ENoSpace
+    rc = vol.file_write("/log", r)       // a full volume: start again
+```
+
+```text
+logger: resumed after record 10
+logger: appended 11 reading 33
+...
+logger: /log holds 15 records
+```
+
+### A configuration file from the host
+
+`examples/config.nv` reads `/etc/config` from a volume that was built
+on the host from a folder and written into the board's data region.
+The image tool is the `novofs-tools` package:
+
+```sh
+mkdir -p files/etc
+printf 'rate=250\n' > files/etc/config
+novofs-tools mk files -o files.bin --target=nrf52832-dk
+novo flash --target=nrf52832-dk --data files.bin
+```
+
+The program mounts the region without formatting it, so a region with
+no volume is reported rather than formatted over, and reads the file
+into a buffer:
+
+```novo norun:fragment
+let vol = nvfs.mount(nvfs.region_flash())
+var buf: Buf = Vec.new()
+let rc = vol.file_read_at("/etc/config", 0, vol.file_size("/etc/config"), buf)
+```
+
+```text
+config: /etc/config holds 9 bytes
+config: rate=250
+config: rate is 250
+```
+
+## If you know littlefs
+
+| littlefs | novofs |
+|---|---|
+| `struct lfs_config` and its `read`, `prog`, `erase` and `sync` callbacks | the `Flash` trait a device implements: `read`, `prog`, `erase`, `sync`, `read_size`, `prog_size`, `block_size`, `block_count` |
+| `read_size`, `prog_size`, `block_size`, `block_count` | the device's methods of the same names |
+| `cache_size`, `lookahead_size`, `block_cycles`, `name_max`, `file_max`, `inline_max` | the fields of `FsConfig`; `default_config()` is a filled one |
+| `lfs_format` | `format(dev, cfg)` |
+| `lfs_mount`, `lfs_unmount` | `mount(dev)`, `mount_with(dev, cfg, format_on_empty)`, `vol.unmount()` |
+| `lfs_mkdir`, `lfs_remove`, `lfs_rename`, `lfs_stat` | `vol.mkdir`, `vol.remove`, `vol.rename`, `vol.stat` |
+| `lfs_file_open`, `lfs_file_write`, `lfs_file_close` | `vol.file_write(path, src)`, `vol.file_append(path, src)` |
+| `lfs_file_open`, `lfs_file_read`, `lfs_file_close` | `vol.file_read_at(path, off, len, buf)` |
+| `lfs_file_size`, `lfs_file_truncate` | `vol.file_size(path)`, `vol.file_truncate(path, len)` |
+| `lfs_dir_open`, `lfs_dir_read`, `lfs_dir_close` | `vol.list(path)`, then `vol.list_next(listing)` until `None` |
+| `lfs_fs_size` | `vol.used_blocks()`, and `vol.info()` for the geometry |
+
+novofs has no open file handles: every operation takes a path and is
+one committed record or one read.  That is the power-cut rule in the
+interface: an operation a cut interrupts leaves the volume as it was
+before the operation or as it is after it.
 
 ## What the package contains
 
 | Module | What is in it |
 |---|---|
-| `flash` | The `Flash` trait a volume sits on, the `Buf` bytes move through, and the `ByteSrc` trait a file is written from |
-| `crc32` | CRC-32C (Castagnoli), four bits at a time through a 16-entry table |
-| `meta` | The metadata-pair mechanics: the read cache, the program buffer, scanning a block's log, and writing a record or a revision word |
-| `nvfs` | The filesystem: the configuration, the errors, the superblock, the directory tree, files, the allocator, and the mounted volume |
-| `hostdev` | The host devices: `RamFlash`, with strict NOR rules, wear counters, bad blocks and power-cut injection, and `FileFlash`, over an image file |
-| `hostfs` | The host's view of a volume: files as `Bytes` and directories as lists |
-| `vfs` | The `FileSystem` trait, and novofs behind it over a `RamFlash` and over an image file |
-| `haladapt` | A `Flash` device over any `BlockDevice` from embedded-hal-nv, and `RamBlock`, a block device in RAM |
-| `halflash` | `HalFlash`, a board's `hal.block` storage as a `Flash` device |
-| `regionflash` | `RegionFlash`, a partition of a board's reserved flash region as a `Flash` device |
-| `main` | The image tool: `mk`, `ls`, `cat`, `extract`, `fsck`, `df` |
+| `nvfs` | The whole public surface: the `Flash` trait and `RegionFlash`, the device over the board's reserved region; `ByteSrc` and the sources a write takes; `FsConfig`, `format`, `mount` and `mount_with`; the `Volume` and the `FileSystem` trait it implements; and the answers, `FsError`, `MountRes`, `FsInfo`, `Entry`, `EntRes` and `Listing` |
+
+The generated reference lists every declaration with its comment.
 
 ## How to choose an entry point
 
-- A device program calls the volume's methods with its board's device,
-  `HalFlash` or `RegionFlash`.  They take a `ByteSrc` and fill a `Buf`,
-  and allocate nothing.
-- A host program that wants whole files and lists uses `hostfs` over a
-  volume on a `RamFlash` or a `FileFlash`.
-- A program that should work with any filesystem takes a
-  `FileSystem`; `vfs.novofs` and `vfs.novofs_file` put a novofs volume
-  behind it.
-- A host build that prepares a volume for a board uses the image tool.
+- A program on a board mounts `nvfs.region_flash()`, the bytes its
+  board's manifest reserves, with `mount_with(dev, cfg, true)` when it
+  owns the region and formats it on the first boot, or with `mount`
+  when the region was written from the host.
+- A program on a board with storage of another kind implements `Flash`
+  for it and mounts that device.
+- A program that should work with any filesystem takes a `FileSystem`
+  as a bounded type parameter, `fn log<F: FileSystem[e]>(fs: F)`; the
+  volume implements it, and so can another filesystem.
+- A host program that prepares a volume for a board, tests a program
+  against a RAM device with power cuts, or wants whole files and
+  listings as `Bytes` and lists, uses the `novofs-tools` package.
 
-The library's surface, in `src/nvfs.nv`: `format(dev, cfg)` and
-`validate(dev, cfg)` on a device; `mount(dev)` and
-`mount_with(dev, cfg, format_on_empty)`, which answer a `Volume`; and
-the volume's methods: `mounted` (the superblock's facts, or why it did
-not mount), `status`, `info`, `mkdir`, `remove`, `rename` (within one
-directory), `file_write`, `file_append`, `file_truncate`, `file_size`,
-`file_read_at` (into a `Buf`), `stat` and `ent_read`, `ent_name_byte`,
-`dir_open`, `dir_open_pair` and `dir_next`, `used_blocks`, and
-`unmount`, which gives the device back.  Every operation takes a path.
-`hostfs` adds `file_read`, `file_read_at`, `dir_list`, `file_write` and
-`file_append` over `Bytes` and lists, each taking the volume.
+### What a write takes
 
-### Plugging in storage: the `Flash` trait
+A file is written from a `ByteSrc`: `src_len` bytes, each answered by
+`src_at`.  The package's own sources:
 
-```novo norun:fragment
-trait Flash[e]                                // src/flash.nv
-    fn read_size(self) -> Int [e]             // geometry
-    fn prog_size(self) -> Int [e]
-    fn block_size(self) -> Int [e]
-    fn block_count(self) -> Int [e]
-    fn read(self, block, off, len, var dst: Buf) -> Bool [e]
-    fn prog(self, block, off, src: Buf) -> Bool [e]   // NOR: only clears bits
-    fn erase(self, block) -> Bool [e]                 // → all 0xFF
-    fn sync(self) -> Bool [e]
-```
+| Source | Use |
+|---|---|
+| a string, `"booted"` | text |
+| a `Buf`, a buffer of at most 512 bytes the program filled | bytes built at run time, in the caller's frame |
+| a list of bytes, `[u8]` | bytes a host program or a program with a heap holds |
+| `no_src()` | an empty file |
 
-The trait binds one effect parameter, `e`, and each implementation
-supplies the effects its storage costs.  The filesystem core is
-generic over `D: Flash[e]` and declares `[mutate, e]`, so it names no
-hardware, file or foreign-function effect of its own: a caller is
-charged the effects of the device it passes.  Bytes cross the trait in
-a `Buf`, a `Vec[u8; 512]` the caller owns, so a read or a prog
-allocates nothing.
+A record of the program's own, such as a `@value` struct, implements
+`ByteSrc` and is written as it is.
 
-| Device | Module | Implements |
-|---|---|---|
-| `RamFlash`: host tests, with strict NOR rules, wear counters and power-cut injection | `hostdev` | `Flash[mutate, ffi]` |
-| `FileFlash`: host image files; backs the image tool | `hostdev` | `Flash[fs]` |
-| `BlockFlash`: any `dyn BlockDevice` from embedded-hal-nv, with a read-modify-write prog that keeps NOR rules | `haladapt` | `Flash[hw, ffi]` |
-| `HalFlash`: a board's `hal.block` storage, the nRF52840-DK's flash or `novo_block.img` under QEMU | `halflash` | `Flash[hw, async, mutate]` |
-| `RegionFlash`: a partition of a board's reserved flash region, one block per erase unit, through `hal.block`'s region surface | `regionflash` | `Flash[hw]` |
+### What a read gives
 
-A device build uses `flash`, `crc32`, `meta`, `nvfs` and its device,
-and never sees `hostdev` or `hostfs`.
-
-### Substituting the whole filesystem: the `FileSystem` trait
-
-A program that needs a filesystem, any filesystem, programs against
-`dyn FileSystem` (`src/vfs.nv`): ten methods that each take a path,
-with the shared `FsError` and `DirEntry` vocabulary.  A capability a
-filesystem lacks answers `ENotSupported`.  The trait binds an effect
-parameter, and novofs provides `NovoFs` over a `RamFlash`
-(`FileSystem[mutate, ffi]`) and `NovoFsFile` over a `FileFlash`
-(`FileSystem[fs, mutate]`).  Another filesystem plugs into the same
-programs by implementing the trait.  The image tool's `fsck` and
-`extract` walk a `FileSystem`.
-
-## The image tool
-
-```bash
-novofs mk ./mytree -o image.bin --block-size 4096 --block-count 256
-novofs mk ./mytree -o image.bin --target=nrf52832-dk   # the board's data region
-novofs ls image.bin                 # kinds and sizes
-novofs ls image.bin /sub
-novofs cat image.bin /readme.txt    # text output (extract is byte-exact)
-novofs fsck image.bin               # verifies the whole tree and counts it
-novofs df image.bin                 # block usage
-novofs extract image.bin -o ./out   # a byte-exact copy of the tree
-```
-
-- `mk` is deterministic: the same tree and flags give a byte-identical
-  image (a sorted walk, an allocation that depends only on the cursor).
-- `mk` must be told the target's geometry (`--prog-size` shapes the
-  metadata layout), typed or with `--target=<board>`.  The read verbs
-  need no flags: they find the superblock in block 0.
-- Every error exits nonzero.
-
-### An image for a board
-
-`mk --target=<board>` builds an image for the board's data region: the
-block size is the flash's erase unit, the block count the region's
-units, and the page the one RegionFlash uses on the board.  The tool
-asks the toolchain for them, `novo bsp region --target=<board>` (the
-toolchain at `$NOVO`, else `novo` on PATH), so the board's manifest,
-its `[flash]` table and the flash's units are read in one place.
-`novo flash --data` then writes the image into the region at its
-start.
-
-```bash
-mkdir -p files/etc
-printf 'hello from the host\n' > files/readme.txt
-printf 'rate=100\n' > files/etc/config
-novofs mk files -o files.bin --target=nrf52832-dk
-novo flash --target=nrf52832-dk --data files.bin
-```
-
-```text
-mk: files.bin ok (5/8 blocks used), for the data region of nrf52832-dk at 0x78000, 8 blocks of 4096 bytes
-novo: writing files.bin into the board nrf52832-dk's data region (block_region), 0x78000 to 0x80000, 8 blocks of 4096 bytes (chip=nRF52832_xxAA, probe=1366:1015:000682139029)
-novo: the data region holds files.bin, read back and compared; the board was reset
-```
-
-A geometry option typed beside `--target` must agree with the
-board's, or `mk` refuses it naming both.  A folder that does not fit
-is refused with the shortfall, in blocks and bytes, and no image is
-written.  On the nRF52832-DK each directory takes a metadata pair of
-two 4 KB blocks and each file larger than `--inline-max` (128 bytes by
-default) at least one block, so the eight blocks hold the root, one
-directory and four such files, and an image that uses all eight leaves
-the board no block for a write that needs one.  `novo flash --data`
-refuses an image whose size, block size, block count or page is not
-the board's.
+`file_read_at(path, off, len, buf)` replaces the contents of a `Buf`
+with at most 512 bytes of the file.  `stat(path)` answers an `Entry`:
+whether it is a directory, its size, and its name's bytes.  `list(path)`
+opens a directory and `list_next(listing)` answers its entries in
+order, and `None` after the last one.  `Entry.name_str()` gives the
+name as a string, from the heap on the host and from the arena on a
+board.
 
 ## The rules a user needs
 
@@ -291,14 +263,19 @@ the board's.
 3. `remove` refuses a directory that still has entries (`ENotEmpty`):
    one tombstone is one atomic commit, and a recursive delete could
    not be.
-4. Append and a truncate that extends rewrite the file, in O(n) of its
-   size.  A truncate that shrinks a chain keeps the chain's prefix.
-5. `nvfs.mount_with(dev, cfg, format_on_empty)` formats a device that
-   holds no filesystem when asked, and never one that holds something
-   else.  An application formats its data region this way on its first
-   boot, and a bootloader never writes it.
-6. A RamFlash's wear counters, bad blocks and power-cut schedule are
-   module state and describe the most recently made RamFlash.
+4. `file_append` and a `file_truncate` that extends rewrite the file,
+   in O(n) of its size.  A truncate that shrinks a chain keeps the
+   chain's prefix.
+5. `mount_with(dev, cfg, format_on_empty)` formats a device that holds
+   no filesystem when asked, and never one that holds something else.
+   An application formats its data region this way on its first boot,
+   and a bootloader never writes it.
+6. A volume that did not mount answers every operation with the
+   mount's error, so a program checks `vol.status()` once.
+7. One volume's state, the read cache and the last block scans, is
+   module storage of a fixed size.  A program with two volumes mounted
+   gets right answers from both, and the state is built again each
+   time it moves from one to the other.
 
 ### The on-flash format
 
@@ -315,190 +292,114 @@ record   = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ], padded with 
 0xFF              reserved forever: erased flash
 ```
 
-The block layout in `src/meta.nv` is the second shape the format took,
-and the change is not backward compatible: a volume written by the
-first shape does not mount.  There is no migration path; `novofs mk`
-rebuilds images from a source tree, so the format is versioned by the
-superblock's `VERSION` word rather than by upgrade code.
-
-The first shape placed records immediately after the 4-byte revision
-word.  The current shape pads records out to
-`meta_off = max(4, prog_size)`, so that records begin on their own prog
-page.  That padding is what makes sealing the revision last safe:
-because no record shares a prog page with the revision word, a
-compaction can program every record and then program the revision
-word as a separate, final operation.  A power cut before that last
-operation leaves the sibling's revision word erased (0xFFFFFFFF, read
-as invalid) and the old block still winning; a power cut after it
-leaves a block that is complete by construction.  With records packed
-against the revision word, one prog page could carry both a partial
-record and a live revision, and neither outcome would be recoverable.
-
-The other format rules, unchanged since the first shape:
-
-- 0xFF is a reserved record type forever, because it is what erased
-  NOR reads as.  The scanner skips runs of 0xFF between records rather
-  than stopping at the first one, since an appended commit starts on a
-  prog-size boundary and padding then a record is the normal layout.
-- A bad CRC ends the block's valid log and marks the block full.  The
-  garbage tail cannot be programmed again reliably, since a prog only
-  clears bits, so the next append goes through a compaction to the
-  sibling.
-- Revision wraparound is undefined.  The revision is a u32 and nothing
-  handles it rolling over; at one compaction per second it would take
-  about 136 years.
+- Records start on their own prog page, `meta_off` bytes into the
+  block, so a compaction can program every record and then the
+  revision word as a separate, final operation.  A cut before that
+  operation leaves the sibling's revision erased, and the old block
+  still wins.
+- 0xFF is a reserved record type, because it is what erased NOR reads
+  as.  The scanner skips runs of 0xFF between records.
+- A bad CRC ends the block's valid log and marks the block full, and
+  the next append goes through a compaction to the sibling.
+- The revision is a u32, and its wraparound is not handled; at one
+  compaction a second it is about 136 years away.
 
 ## Running on a microcontroller
 
-The core (`flash`, `crc32`, `meta`, `nvfs`) is declared
-`@tier(embedded)`, so every build checks it against the embedded tier,
-and it runs in fixed memory: three `Buf`s of static storage (the read
+Every function of `nvfs` builds for a microcontroller with no heap
+allocator, and the registry lists the package at the embedded tier.
+The effects of a device program's calls are `hw` and `mutate`: a
+volume on `RegionFlash` is charged `[mutate, hw]`, and each operation
+is charged the effects of the device it holds.  The filesystem runs in
+fixed memory: three 512-byte buffers of static storage (the read
 cache, the program buffer and the staging buffer of a record's inline
-data, 1,560 bytes), the allocator's 64-byte bitmap and 136-byte
-retired-block list, the last two block scans (32 bytes), and the
-frames of the call in progress, beside the mounted volume in the
-arena.  It walks a metadata log in place instead of folding it into a
-list, and writes a record or a data block through the program buffer
-as it reads its source.  Every operation on a mounted volume passes
-`@no_alloc`.
+data), the allocator's 64-byte bitmap and its list of retired blocks,
+the last two block scans, and the frames of the call in progress.  The
+volume is the one allocation a mount makes, from the arena.  Every
+operation on a mounted volume allocates nothing, except
+`Entry.name_str`, which builds a string.
 
 | Measure | Value |
 |---|---|
-| `.text` of the core, MPS2 AN386 build | 39,168 bytes |
-| Static RAM beyond the read cache and the program buffer | 984 bytes |
-| Deepest chain of stack frames below a volume's `file_write`, STM32F407 image | 3,656 bytes |
-
-| Device | Module | Implements |
-|---|---|---|
-| `HalFlash`: a board's `hal.block`, the nRF52840-DK's flash, or `novo_block.img` under QEMU | `src/halflash.nv` | `Flash[hw, async, mutate]` |
-| `RegionFlash`: a partition of a board's reserved region, one block per erase unit | `src/regionflash.nv` | `Flash[hw]` |
-| `EmRam`: a RAM volume in static storage, with power-cut injection | `examples/emram.nv` | `Flash[mutate]` |
-
-The host modules (`hostdev`, `hostfs`, `haladapt`, `vfs`) declare
-every function `@tier(app)`: a device program that depends on novofs
-is checked and linked without them.  The image tool, `src/main.nv`,
-keeps the package as a whole at the app tier; the registry lists the
-embedded, rt and system tiers for every other module, and wasm for
-`crc32`, `flash`, `hostfs`, `meta` and `nvfs`.
-
-### HalFlash
-
-A board with storage offers `hal.block`: a fixed number of blocks of a
-fixed size, a staging buffer the size of a block, and three arms
-(read, write, erase) that each resolve a Future.  On the nRF52840-DK
-the blocks are 512-byte slices of the top eight 4 KB pages of the
-chip's flash, driven through its NVMC; under QEMU's MPS2 AN386 they
-are 64 blocks of 512 bytes in `novo_block.img`, over semihosting.
-HalFlash reports a 16-byte page and programs by a read-modify-write of
-the whole block, so each prog costs one page erase on the DK.
+| `.text` of the filesystem, every operation used, MPS2 AN386 build | 45,704 bytes |
+| Static RAM: the read cache and the program buffer | 1,040 bytes |
+| Static RAM beyond them: the staging buffer, the allocator's bitmap and retired list, the kept scans | 760 bytes |
+| Deepest chain of stack frames below a volume's `file_write`, STM32F407G-DISC1 and nRF52832-DK images | 3,656 bytes |
 
 ### On a board's flash: RegionFlash
 
 A board with a flash driver states the bytes the block device may
-erase and write, `block_region` in its manifest, and `hal.block`'s
-region surface reaches them by offset in the units the flash erases
-and programs.  RegionFlash is a partition of that region: the whole of
-it, `regionflash.region_flash()`, or `size` bytes from the address
-`start`, `regionflash.region_flash_at(start, size)`, which must lie
-inside the region and start and end on erase units (a partition that
-does not has no blocks, and its mount is refused).
-
-```novo norun:fragment
-use flash
-use nvfs
-use regionflash
-
-let dev = regionflash.region_flash()          // the manifest's block_region
-let vol = nvfs.mount_with(dev, nvfs.default_config(), true)   // format on empty
-match vol.mounted()
-    MOk(info) =>
-        let _ = vol.file_append("/log", Word { v: reading })
-    MErr(e) => ...
-```
+erase and write, `block_region` in its manifest or the data region of
+its `[flash]` table, and `hal.block`'s region surface reaches them by
+offset in the units the flash erases and programs.  `region_flash()`
+is the whole region, and `region_flash_at(start, size)` a partition of
+it that starts and ends on erase units.
 
 One novofs block is one erase unit.  A metadata pair is two blocks the
 filesystem erases one at a time, and a block is erased only when
 nothing in it is live, so a block has to be a unit the flash erases on
-its own.  Inside a block the filesystem appends: a prog programs bytes
-of an erased unit and never erases, so a reset in the middle of a prog
-loses that prog only, and the record's checksum rejects what it left.
-What the mapping costs: a file too large for its directory record
-takes at least one whole unit, and a compaction erases a whole unit.
+its own.  Inside a block the filesystem appends: a program writes
+bytes of an erased unit and never erases, so a reset in the middle of
+one loses that write only.  What the mapping costs: a file too large
+for its directory record takes at least one whole unit, and a
+compaction erases a whole unit.
 
 | Board | Region | Blocks | Erase of a block | What a volume holds |
 |---|---|---|---|---|
 | nRF52832-DK, nRF52840-DK | the top 32 KB | 8 of 4,096 bytes | up to 85 ms, by the nRF52840 Product Specification | the metadata pair and six data blocks |
-| STM32F407G-DISC1 | sectors 10 and 11, 256 KB | 2 of 131,072 bytes | 1.0 s, measured by the flash suite | the metadata pair only: files up to `inline_max` bytes, in their directory records |
-
-### The examples
-
-The examples are device programs, built with the novofs modules they
-name copied beside them:
-
-| Example | What it shows |
-|---|---|
-| `examples/boot_counter.nv` | format, mount, a counter file incremented across five mounts, remount, verify |
-| `examples/powerloss.nv` | every cut point of a scripted workload, clean and torn, remounts to a state the workload passed through |
-| `examples/crossmount.nv` | a `novofs mk` image mounted and written on the device, read back on the host |
-| `examples/region_bench.nv` | four boots on a board's reserved region: format, write, read, a fill to the refusal, a cut in the middle of a write, a reset by the probe |
-| `examples/image_read.nv` | a `mk --target` image mounted read-only from the board's data region: the geometry the driver answers, every entry, each file's CRC-32C, the digest |
-| `examples/image_write.nv` | a file written on the board into that volume, for the host's `ls` and `cat` |
-| `examples/emram.nv`, `examples/devtools.nv` | the RAM device and the helpers the other examples share |
+| STM32F407G-DISC1 | sectors 10 and 11, 256 KB | 2 of 131,072 bytes | 1.0 s, measured on the board | the metadata pair only: files up to `inline_max` bytes, in their directory records |
+| Raspberry Pi Pico (RP2040) | the top 32 KB of its 2 MB flash | 8 of 4,096 bytes | as the flash part's datasheet gives it | the metadata pair and six data blocks |
 
 ## What is not included
 
-- A `Flash` device over embedded-hal-nv's `AsyncBlock`, for storage
-  that completes on an interrupt.  Such a device implements `Flash`
-  over the awaitable trait.
+- A device over embedded-hal-nv's `AsyncBlock`, for storage that
+  completes on an interrupt.  Such a device implements `Flash` over the
+  awaitable trait.
 - O(1) append at a file's tail: it needs file handles, which this
-  API's path-based operations do not have.  The format leaves room for
-  them.
+  interface does not have.  The format leaves room for them.
 - A rename across directories: it needs littlefs-style global move
   state.
 - A record on the flash of the blocks retired after a failure: the
-  retired set lives as long as the process, and a block retired after a
-  failed erase is a candidate again on the next mount.
+  retired set lives as long as the program, and a block retired after
+  a failed erase is a candidate again on the next mount.
 - Revision wraparound, as above.
 - littlefs compatibility.
+- The image tool, the RAM and image-file devices and the host's view
+  of a volume: they are the `novofs-tools` package.
 
 ## Related packages
 
-- [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv)
-  defines the `BlockDevice` trait, which `haladapt` turns into a
-  `Flash` device, and the board handles a program reaches storage
-  through.
+- [novofs-tools](https://novo-lang.org/packages/novofs-tools) is the
+  host's side: the image tool (`mk`, `ls`, `cat`, `fsck`, `df`,
+  `extract`), a RAM device with power-cut injection, an image-file
+  device, an adapter from embedded-hal-nv's `BlockDevice`, and whole
+  files and listings over any `FileSystem`.
+- [crc-nv](https://novo-lang.org/packages/crc-nv) computes the
+  CRC-32C every record carries.
 - [littlefs](https://github.com/littlefs-project/littlefs), in C, is
   the design this format is modelled on.
 
 ## Tests
 
-`novo test tests` runs the host suites:
+`novo test tests` runs the host suites, each over a RAM device of its
+own:
 
 | Suite | What it asserts |
 |---|---|
 | `tests/core_tests.nv` | the CRC-32C check value, the record sizes, the path components, the skip-list geometry, the default configuration |
-| `tests/volume_tests.nv` | format, mount and its refusals, `mount_with`, every operation of the volume and what each answers for a path it cannot serve, inline and chained files, append, truncate, a full volume, two volumes in turn |
-| `tests/media_tests.nv` | compaction, the move of a worn metadata pair, superblocks and records written by hand, the arbitration of a pair, renames from absent names, devices whose reads, progs, erases or syncs fail, a power cut at every step of a compaction, reads that fail at every point of a mount, a compaction and a move |
-| `tests/layout_tests.nv` | every rule `validate` checks, the read cache and the kept scans, a record that runs past its block, 4-byte pages, 2 KB blocks, a long chain of renames, the allocator's retries, a directory that contains itself |
-| `tests/host_tests.nv` | RamFlash's NOR rules, bad blocks and power cuts; FileFlash over an image file and on a full device; the `FileSystem` trait over both host devices; RamBlock and the block-device adapter |
-| `tests/board_tests.nv` | HalFlash and RegionFlash on the host, which has no storage for them |
+| `tests/volume_tests.nv` | format, mount and its refusals, `mount_with`, every operation of the volume and what each answers for a path it cannot serve, listings, inline and chained files, append, truncate, a full volume, two volumes in turn |
+| `tests/media_tests.nv` | compaction, the move of a worn metadata pair, superblocks and records written by hand, the arbitration of a pair, renames from absent names, devices whose reads, programs, erases or syncs fail, a power cut at every step of a compaction, reads that fail at every point of a mount, a compaction and a move |
+| `tests/layout_tests.nv` | every rule the configuration is checked by, the read cache and the kept scans, a record that runs past its block, 4-byte pages, 2 KB blocks, a long chain of renames, the allocator's retries, a directory that contains itself |
+| `tests/filesystem_tests.nv` | a program that names `nvfs` alone: a device of its own, and a write, an append and a listing through the `FileSystem` trait |
+| `tests/board_tests.nv` | RegionFlash on the host, which has no region, and the sources a write takes |
 
-Together they run every line under `src/` that the host reaches; the
-coverage the publish measures is the host's.  The lines that only a
-board's storage reaches, in `halflash.nv` and `regionflash.nv`, carry a
-`cov: skip` marker that says so, and they are measured on the boards.
-The novo-lang repository runs the device half and the image tool
-against this package's sources: a 115-check functional suite, a
-power-loss harness of 1,096 cuts (every prog and erase boundary, clean
-and with three kinds of tear, with no state left unexplained), the
-image tool's checks, the 0.1.0 image in `tests/fixtures/` read and
-written by this release, a QEMU run of the examples (both directions
-of the cross-mount, the boot counter, 46 cut points on the device, the
-footprint), and the four-boot bench of `examples/region_bench.nv` on
-the nRF52832-DK and the STM32F407G-DISC1 (`tests/board_bench.sh` and
-`tests/board_image.sh`, driven by each board's `tests/novofs.sh` and
-`tests/image.sh`), which measures `regionflash.nv`'s line coverage on
-the board.
+Together they run every line of `src/` that the host reaches.  The
+lines that only a board's region reaches carry a `cov: skip` marker
+that says so.  The novo-lang repository runs the device half: the
+examples on QEMU's MPS2 AN386 and on the nRF52832-DK and the
+STM32F407G-DISC1, a power-loss harness over every program and erase
+boundary of a scripted workload, and a four-boot bench on each board's
+reserved region.
 
 ## Licence
 

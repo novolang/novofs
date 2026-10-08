@@ -1,45 +1,24 @@
-// The board devices on the host.  The host has no `hal.block` storage:
-// it reports no blocks and no reserved region, and refuses every
-// access.  So HalFlash reports zero blocks and refuses every read, prog
-// and erase, RegionFlash's whole region is a partition of no blocks,
-// and a mount of either is refused.  What they do on a board is
-// measured on the board.
+// The board's region device on the host.  The host has no `hal.block`
+// storage: it reports no reserved region and refuses every access.  So
+// RegionFlash's whole region is a partition of no blocks, and a mount
+// of it is refused.  What it does on a board is measured on the board.
 
 use std.test
 
-use flash
 use nvfs
-use halflash
-use regionflash
 
 fn want(got: FsError, exp: FsError)
     test.assert_eq_str(nvfs.err_str(got), nvfs.err_str(exp))
 
 @test
-fn test_hal_flash_on_the_host_has_no_blocks()
-    let dev = halflash.hal_flash()
-    test.assert_eq(dev.read_size(), 16)
-    test.assert_eq(dev.prog_size(), 16)
-    test.assert_eq(dev.block_size(), 0)
-    test.assert_eq(dev.block_count(), 0)
-    test.assert(dev.sync())
-    var buf: Buf = Vec.new()
-    test.assert_false(dev.read(0, 0, 16, buf), "a read of a block the host lacks")
-    test.assert_eq(buf.len(), 0)
-    let _ = buf.push(0 as u8)
-    test.assert_false(dev.prog(0, 0, buf), "a prog of a block the host lacks")
-    test.assert_false(dev.erase(0), "an erase of a block the host lacks")
-    want(nvfs.mount(dev).status(), EGeometry)
-
-@test
 fn test_region_flash_on_the_host_has_no_blocks()
-    let whole = regionflash.region_flash()
+    let whole = nvfs.region_flash()
     test.assert_eq(whole.block_count(), 0)
     test.assert_eq(whole.block_size(), 0)
     test.assert_eq(whole.read_size(), 16)
     test.assert_eq(whole.prog_size(), 16)
     test.assert(whole.sync())
-    let part = regionflash.region_flash_at(0x1000, 0x2000)
+    let part = nvfs.region_flash_at(0x1000, 0x2000)
     test.assert_eq(part.block_count(), 0)
     var buf: Buf = Vec.new()
     test.assert_false(part.read(0, 0, 16, buf), "a read outside the partition")
@@ -48,3 +27,20 @@ fn test_region_flash_on_the_host_has_no_blocks()
     test.assert_false(part.erase(0), "an erase outside the partition")
     want(nvfs.mount(part).status(), EGeometry)
     want(nvfs.mount_with(part, nvfs.default_config(), true).status(), EGeometry)
+
+@test
+fn test_a_string_and_a_buffer_are_sources()
+    let s = "abc"
+    test.assert_eq(s.src_len(), 3)
+    test.assert_eq(s.src_at(1), 98)
+    test.assert_eq(s.src_at(9), 0)
+    var b: Buf = Vec.new()
+    let _ = b.push(7)
+    let _ = b.push(250)
+    test.assert_eq(b.src_len(), 2)
+    test.assert_eq(b.src_at(1), 250)
+    let xs: [u8] = [1, 2, 3]
+    test.assert_eq(xs.src_len(), 3)
+    test.assert_eq(xs.src_at(2), 3)
+    test.assert_eq(nvfs.no_src().src_len(), 0)
+    test.assert_eq(nvfs.no_src().src_at(0), 0)

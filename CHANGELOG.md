@@ -5,6 +5,97 @@ All notable changes to novofs are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.0 — 2026-10-08
+
+The package is the device's filesystem, with one public module,
+`nvfs`.  The host's tools are the new `novofs-tools` package.  It needs
+novo 0.20.1 or later, the first release in which a trait impl for a
+struct forwards the effect parameter the struct binds (SPEC § 5.6, "An
+impl forwards it").
+
+### Added
+
+- `FileSystem[e]`, a public trait whose methods carry the volume's
+  names: `mkdir`, `remove`, `rename`, `stat`, `list`, `list_next`,
+  `file_write`, `file_append`, `file_read_at`, `file_size`,
+  `file_truncate` and `used_blocks`.  `Volume<D>` implements it as
+  `FileSystem[mutate, e]`, charged the effects of its device, and
+  another filesystem implements it too.
+- `list(path)` and `list_next(listing)`, which list a directory as a
+  `Listing` and answer each `Entry` in order, then `None`.
+- `Entry`, a directory entry with `is_dir`, `size` and its name's
+  bytes, and `Entry.name_str()`, its name as a string.  `stat` answers
+  an `Entry`.
+- Sources a write takes without an impl of the program's own: a string
+  literal, a `Buf`, and a list of bytes, each `ByteSrc`.
+- `RegionFlash`, `region_flash()` and `region_flash_at(start, size)` in
+  `nvfs`.
+- The README leads with three programs for a board, in `examples/`:
+  `settings.nv`, a record kept across resets; `logger.nv`, a log of
+  readings appended one record at a time; and `config.nv`, a file read
+  from a volume built on the host.  It has a section for a reader who
+  knows littlefs.
+
+### Changed
+
+- CRC-32C is crc-nv's (`crc32c_start`, `crc32c_step`, `crc32c_finish`,
+  crc-nv 0.1.6), a new dependency.  The values are the same.
+- `layer = "host"`: the public surface's effects are `hw` and `mutate`.
+  embedded-hal-nv is no longer a dependency.
+- `format` forgets the blocks retired after failures and starts the
+  allocator from its first block, as a fresh volume.  A program that
+  formatted twice in one run kept the first volume's retired blocks.
+- The filesystem is one module, so a device image that names `nvfs`
+  carries its static storage, 1,800 bytes, whether or not it mounts a
+  volume.  The `.text` of a build that uses every operation is 45,704
+  bytes on the MPS2 AN386, where 0.2.1's was 39,168: the `FileSystem`
+  impl, `Entry` and the listing.
+
+### Removed (breaking)
+
+Each removal names what replaces it.
+
+- **The modules `flash`, `meta`, `crc32`, `regionflash`, `hostdev`,
+  `hostfs`, `vfs`, `haladapt`, `halflash` and the program `main`.**
+  `use flash`, `use regionflash` and `use crc32` become `use nvfs`:
+  `Flash`, `Buf`, `BUF_CAP`, `ByteSrc`, `NoSrc`, `no_src`,
+  `RegionFlash`, `region_flash` and `region_flash_at` are `nvfs`'s.
+  `crc32.update(c, b)` is crc-nv's `crc.crc32c_step(c, b)`, from a
+  register started with `crc.crc32c_start()` and finished with
+  `crc.crc32c_finish(c)`.
+- **`halflash` and `HalFlash`**, the device over `hal.block`'s 512-byte
+  blocks.  A program mounts the board's reserved region with
+  `nvfs.region_flash()`, which QEMU's MPS2 machines reach too.  A
+  volume written by HalFlash does not mount on RegionFlash: the blocks
+  differ in size, and `mount_with(dev, cfg, true)` reports it rather
+  than formatting over it, so a program that changes device formats
+  the region once with `nvfs.format`.
+- **The image tool, `novofs mk|ls|cat|fsck|df|extract`**, and the host
+  modules `hostdev` (`RamFlash`, `FileFlash`, `ram_flash`,
+  `file_flash`, the power-cut, wear and bad-block controls,
+  `prog_bytes`, `read_bytes`), `hostfs` (`src`, `dir_list`,
+  `file_read`, `file_read_at`, `file_write`, `file_append`,
+  `entry_size`) and `haladapt` (`RamBlock`, `BlockFlash`, `ram_block`,
+  `block_flash`).  They are the `novofs-tools` package: `novo install
+  novofs-tools` installs the image tool as `novofs-tools`, and a host
+  program takes the devices and the wrappers from it with
+  `novofs-tools = "^0.1.0"`.  The RAM device keeps its cells in a list,
+  so its effects are `[mutate]` where they were `[mutate, ffi]`.
+- **`vfs`'s `FileSystem` with its `fs_` methods, `NovoFs`,
+  `NovoFsFile`, `novofs()` and `novofs_file()`.**  The volume
+  implements `nvfs.FileSystem` itself: `f.fs_mkdir(p)` is
+  `vol.mkdir(p)`, `f.fs_list(p)` is `vol.list(p)` with `list_next`,
+  `f.fs_read_at(p, off, len)` is `vol.file_read_at(p, off, len, buf)`,
+  and the `Bytes` forms are novofs-tools' `hostfs`.
+- **The volume's methods `dir_open`, `dir_open_pair`, `dir_next`,
+  `ent_read` and `ent_name_byte`, and `DirOpen`, `DirCur` and `Ent`.**
+  `vol.list(path)` and `vol.list_next(listing)` list a directory and
+  answer `Entry` values; a file's bytes are read by path with
+  `file_read_at`.
+- **`validate`, `ent_size` and `wear_reset` are no longer public.**
+  `format` answers EInvalidConfig for a configuration `validate`
+  refused, and an `Entry`'s `size` is what `ent_size` answered.
+
 ## 0.2.1 — 2026-10-08
 
 - The rename resolver's backward search is a function of its own, so
