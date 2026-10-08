@@ -482,7 +482,7 @@ fn resolve<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
         let j = hops - 1 - back
         let en = resolve_hop(dev, blk, limit, key, cur, j, depth)
         if en.found
-            return renamed(dev, blk, limit, en, if j == 0 then -1 else first_off)
+            return renamed(dev, blk, limit, en, (if j == 0 then -1 else first_off))
     no_ent()
 
 // The entry below the j-th rename of the chain from `key`: the chain's
@@ -490,8 +490,8 @@ fn resolve<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
 // that hop's record.  Its own function, so the walk's records are in
 // this frame and not in resolve's, which holds the outer walk's.
 @tier(embedded)
-fn resolve_hop<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf,
-                            var cur: NameBuf, j: Int, depth: Int) -> Ent [mutate, e]
+fn resolve_hop<D: Flash[e]>(dev: D, blk: Int, limit: Int, var key: NameBuf, var cur: NameBuf,
+                            j: Int, depth: Int) -> Ent [mutate, e]
     copy_key(cur, key)
     var lim = limit
     for t in 0..j
